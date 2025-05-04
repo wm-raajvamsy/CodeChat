@@ -1,0 +1,13 @@
+# Python
+backend/__pycache__/
+backend/*.pyc
+
+# Node
+frontend/node_modules/
+
+# Logs, temp
+*.log
+.env
+
+# Git
+.git

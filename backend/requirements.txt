@@ -1,0 +1,15 @@
+ollama
+InstructorEmbedding
+torch==2.1.2
+sentence-transformers==2.2.2
+huggingface-hub==0.25.2
+chromadb
+node2vec
+networkx
+rank_bm25
+nltk
+prometheus-client
+faiss-cpu
+flask
+flask-cors
+numpy
