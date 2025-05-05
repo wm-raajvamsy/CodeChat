@@ -16,7 +16,7 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await axios.get('http://localhost:6145/api/ollama/models');
+        const response = await axios.get('http://localhost:6146/api/ollama/models');
         const models = response.data.models || [];
   
         const withIcons = models
