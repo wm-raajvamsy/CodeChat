@@ -546,7 +546,7 @@ const App = () => {
                 {/* Combine Search Toggle */}
                 <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
                   <div className="flex items-center justify-between">
-                    <label htmlFor="streaming-toggle" className="flex items-center cursor-pointer">
+                    <label htmlFor="combineSearch-toggle" className="flex items-center cursor-pointer">
                       <div className="relative">
                         <input
                           id="combineSearch-toggle"

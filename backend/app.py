@@ -701,7 +701,7 @@ def search_kbs(kb: [], query: str, top_k: int = 5) -> List[Dict]:
     all_chunks = []   # will be a list of lists: [[chunks_kb1], [chunks_kb2], …]
     all_indices = []  # parallel list of FAISS Index objects
 
-    for kb_id in kb_ids:
+    for kb_id in kb:
         chunks, idx, _ = load_kb_data(kb_id)
         if chunks is None or idx is None:
             print(f"Knowledge base {kb_id} not found or data is corrupt")
@@ -1246,7 +1246,7 @@ def combinedSearch():
         return jsonify({"error": "No data provided"}), 400
     
     query = data.get('query')
-    knowledgeBases = data.get('kb')
+    knowledgeBases = data.get('kb_id')
     top_k = data.get('top_k', 5)
     
     if not query:

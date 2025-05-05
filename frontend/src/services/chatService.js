@@ -88,10 +88,10 @@ export const processChat = async (userMessage, knowledgeBases = [], config = {})
     if (knowledgeBases && knowledgeBases.length > 0) {
       console.log(`Retrieving context from ${knowledgeBases.length} knowledge bases...`);
       if (finalConfig.combineSearch) {
-          const kb_ids = knowledgeBases.map(kb => kb.kb_id);
-          const names = knowledgeBases.map(kb => kb.name).join(",");
-          // Search knowledge base for relevant snippets
-          const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
+        const kb_ids = knowledgeBases.map(kb => kb.id);
+        const names = knowledgeBases.map(kb => kb.name).join(",");
+        // Search knowledge base for relevant snippets
+        const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
 
           if (snippets && snippets.length > 0) {
             console.log(`Found ${snippets.length} relevant snippets from ${names}`);
@@ -192,10 +192,10 @@ export const processChatStreaming = async (
     if (knowledgeBases && knowledgeBases.length > 0) {
       console.log(`Retrieving context from ${knowledgeBases.length} knowledge bases...`);
       if (finalConfig.combineSearch) {
-          const kb_ids = knowledgeBases.map(kb => kb.kb_id);
-          const names = knowledgeBases.map(kb => kb.name).join(",");
-          // Search knowledge base for relevant snippets
-          const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
+        const kb_ids = knowledgeBases.map(kb => kb.id);
+        const names = knowledgeBases.map(kb => kb.name).join(",");
+        // Search knowledge base for relevant snippets
+        const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
 
           if (snippets && snippets.length > 0) {
             console.log(`Found ${snippets.length} relevant snippets from ${names}`);
