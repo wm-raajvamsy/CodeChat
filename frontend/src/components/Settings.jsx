@@ -30,7 +30,12 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
               icon: ICON_MAP['cpu'] || <Cpu size={16} />,
             };
           });
-  
+         withIcons.push({
+          value: "openai",
+          label: "OpenAI",
+          description: "",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        })
         setModelOptions(withIcons);
       } catch (error) {
         console.error('Failed to load models:', error);
@@ -149,6 +154,22 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
               <p className="mt-2 text-sm text-gray-500">
                 Maximum length of the generated response.
               </p>
+            </div>
+
+            {/* OpenAI API Key */}
+            <div className="bg-gray-50 p-4 rounded-lg">
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-gray-700 font-medium">OpenAI API Key</label>
+              </div>
+              <input
+                type="text"
+                value={config.openaiKey || localStorage.getItem("openapikey")}
+                onChange={(e) => {
+                  localStorage.setItem("openapikey", e.target.value);
+                  setConfig({...config, openaiKey: e.target.value})
+                }}
+                className="w-full h-15 pl-4 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-500"
+              />
             </div>
           </div>
         </div>

@@ -691,6 +691,61 @@ def load_kb_data(kb_id: str) -> Tuple[List[CodeChunk], faiss.Index, Dict]:
         traceback.print_exc()
         return None, None, None
 
+def search_kbs(kb: [], query: str, top_k: int = 5) -> List[Dict]:
+    """
+    Search a specific knowledge base for relevant code snippets
+    """
+    if instructor_model is None:
+        load_model()
+    
+    all_chunks = []   # will be a list of lists: [[chunks_kb1], [chunks_kb2], …]
+    all_indices = []  # parallel list of FAISS Index objects
+
+    for kb_id in kb_ids:
+        chunks, idx, _ = load_kb_data(kb_id)
+        if chunks is None or idx is None:
+            print(f"Knowledge base {kb_id} not found or data is corrupt")
+            continue
+
+        all_chunks.append(chunks)
+        all_indices.append(idx)
+        
+    # Embed the query
+    q_emb = instructor_model.encode([[QUERY_INSTRUCTION, query]])
+    q_emb = np.array(q_emb).astype('float32')
+    faiss.normalize_L2(q_emb)
+
+    # 1) Search each index and collect (score, chunk)
+    all_hits = []
+    for idx_obj, chunks in zip(all_indices, all_chunks):
+        D, I = idx_obj.search(q_emb, top_k)
+        for score, local_i in zip(D[0], I[0]):
+            if 0 <= local_i < len(chunks):
+                all_hits.append((score, chunks[local_i]))
+
+    # 2) Sort all hits by descending score and pick top_k overall
+    all_hits.sort(key=lambda x: x[0], reverse=True)
+    top_hits = all_hits[:top_k]
+
+    # 3) Format results exactly as before
+    results = []
+    for score, chunk in top_hits:
+        results.append({
+            'content':    chunk.content,
+            'file_path':  chunk.file_path,
+            'chunk_type': chunk.chunk_type,
+            'name':       chunk.name,
+            'score':      float(score),
+            'metadata': {
+                'line_start':   chunk.line_start,
+                'line_end':     chunk.line_end,
+                'dependencies': chunk.dependencies,
+                'git_info':     chunk.git_info
+            }
+        })
+    
+    return results
+
 def search_kb(kb_id: str, query: str, top_k: int = 5) -> List[Dict]:
     """
     Search a specific knowledge base for relevant code snippets
@@ -1178,7 +1233,33 @@ def list_ollama_models():
             "error": "Failed to list Ollama models",
             "details": e.stderr or str(e)
         }), 500
-        
+
+@app.route('/api/combineSearch', methods=['POST'])
+def combinedSearch():
+    """Search the combined code index for relevant snippets"""
+    if instructor_model is None:
+        return jsonify({"error": "Server is still initializing"}), 503
+    
+    # Get request data
+    data = request.json
+    if not data:
+        return jsonify({"error": "No data provided"}), 400
+    
+    query = data.get('query')
+    knowledgeBases = data.get('kb')
+    top_k = data.get('top_k', 5)
+    
+    if not query:
+        return jsonify({"error": "No query provided"}), 400
+    
+    try:
+        results = search_kbs(knowledgeBases, query, top_k)
+        return jsonify({"results": results})
+    except Exception as e:
+        print(f"Error during search: {e}")
+        traceback.print_exc()
+        return jsonify({"error": f"Search failed: {str(e)}"}), 500
+
 @app.route('/api/search-all', methods=['POST'])
 def search_all():
     """Search across all active knowledge bases"""

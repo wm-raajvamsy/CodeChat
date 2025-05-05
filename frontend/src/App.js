@@ -48,7 +48,9 @@ const App = () => {
     topK: 40,
     maxTokens: 1000,
     model: 'qwen2.5:14b-instruct',
-    streamingEnabled: true
+    streamingEnabled: true,
+    combineSearch: false,
+    openaiKey: ""
   });
 
   // Knowledge base state
@@ -541,6 +543,33 @@ const App = () => {
                   </p>
                 </div>
 
+                {/* Combine Search Toggle */}
+                <div className="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                  <div className="flex items-center justify-between">
+                    <label htmlFor="streaming-toggle" className="flex items-center cursor-pointer">
+                      <div className="relative">
+                        <input
+                          id="combineSearch-toggle"
+                          type="checkbox"
+                          checked={config.combineSearch}
+                          onChange={(e) =>
+                            setConfig({ ...config, combineSearch: e.target.checked })
+                          }
+                          className="sr-only"
+                        />
+                        <div className={`block w-10 h-6 rounded-full ${config.combineSearch ? 'bg-blue-600' : 'bg-gray-600'}`}></div>
+                        <div className={`absolute left-1 top-1 bg-white w-4 h-4 rounded-full transition-transform ${config.combineSearch ? 'transform translate-x-4' : ''}`}></div>
+                      </div>
+                      <span className="ml-3 text-sm font-medium text-gray-200">
+                        Combine Search
+                      </span>
+                    </label>
+                  </div>
+                  <p className="mt-2 text-xs text-gray-400">
+                    Combine all embedding and indexes.
+                  </p>
+                </div>
+
                 {/* Knowledge Bases */}
                 <div className="bg-gray-800 p-2 rounded-lg border border-gray-700">
                   <h3 className="text-sm font-semibold text-gray-100 mb-3 flex items-center">
@@ -621,6 +650,16 @@ const App = () => {
                   </div>
                   <span className="tooltip-text absolute left-12 bg-gray-800 px-2 py-1 text-xs rounded hidden">
                     Streaming
+                  </span>
+                </div>
+                <div className="tooltip relative">
+                  <div className={`p-2 py-1 rounded-lg cursor-pointer transition-all duration-200 ${config.combineSearch ? 'bg-blue-600' : 'bg-gray-800 hover:bg-gray-700'}`}>
+                    <span className="text-xs text-gray-200">
+                      {config.combineSearch ? 'ON' : 'OFF'}
+                    </span>
+                  </div>
+                  <span className="tooltip-text absolute left-12 bg-gray-800 px-2 py-1 text-xs rounded hidden">
+                    Combine Search
                   </span>
                 </div>
               </div>

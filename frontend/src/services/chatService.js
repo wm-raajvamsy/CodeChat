@@ -1,11 +1,63 @@
 // services/chatService.js
 import axios from 'axios';
 import { handleApiError, reportError } from './errorHandlingService';
-import { searchKnowledgeBase } from './knowledgeBaseService';
+import { searchCombineKnowledgeBase, searchKnowledgeBase } from './knowledgeBaseService';
 
 // API configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:6146/api';
 const OLLAMA_URL = process.env.REACT_APP_OLLAMA_URL || 'http://localhost:11434/api';
+const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+// const OPENAI_API_KEY = process.env.OPENAI_API_KEY || localStorage.getItem('openaiKey');
+
+/**
+ * Send a user message (with optional context) to OpenAI and return the assistant's reply.
+ * @param {string} userMessage
+ * @param {string[]} contextSnippets
+ * @returns {Promise<string>}
+ */
+export async function callOpenAI(userMessage, openaiKey, contextSnippets = []) {
+  // Construct the prompt/messages based on whether we have context
+  const messages = [
+    { role: 'system', content: 'You are a helpful assistant.' },
+    // inject any prior context snippets as system messages, if you like:
+    // ...contextSnippets.map((snippet) => ({ role: 'system', content: snippet })),
+    { role: 'user', content: userMessage }
+  ];
+
+  console.log(`Sending prompt to OpenAI (model: gpt-4)...`);
+
+  const response = await axios.post(
+    OPENAI_URL,
+    {
+      model: 'gpt-4.1-nano-2025-04-14',
+      messages: messages,
+      temperature: 0.7,
+      top_p: 0.9,
+      max_tokens: 1024,
+      stream: false
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${openaiKey}`
+      }
+    }
+  );
+
+  // Basic validation of the OpenAI response
+  if (
+    !response.data ||
+    !response.data.choices ||
+    !response.data.choices.length ||
+    !response.data.choices[0].message ||
+    !response.data.choices[0].message.content
+  ) {
+    throw new Error('Invalid response from OpenAI API');
+  }
+
+  return response.data.choices[0]?.message?.content;
+}
+
 
 /**
  * Process a chat message using the knowledge base and Ollama
@@ -35,24 +87,41 @@ export const processChat = async (userMessage, knowledgeBases = [], config = {})
     // For each selected knowledge base, fetch relevant snippets
     if (knowledgeBases && knowledgeBases.length > 0) {
       console.log(`Retrieving context from ${knowledgeBases.length} knowledge bases...`);
+      if (finalConfig.combineSearch) {
+          const kb_ids = knowledgeBases.map(kb => kb.kb_id);
+          const names = knowledgeBases.map(kb => kb.name).join(",");
+          // Search knowledge base for relevant snippets
+          const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
 
-      for (const kb of knowledgeBases) {
-        // Search knowledge base for relevant snippets
-        const snippets = await searchKnowledgeBase(kb.id, userMessage, finalConfig.topK);
+          if (snippets && snippets.length > 0) {
+            console.log(`Found ${snippets.length} relevant snippets from ${names}`);
+            contextSnippets.push({
+              kbName: names,
+              snippets: snippets
+            });
+          }
+      }
+      else {
+        for (const kb of knowledgeBases) {
+          // Search knowledge base for relevant snippets
+          const snippets = await searchKnowledgeBase(kb.id, userMessage, finalConfig.topK);
 
-        if (snippets && snippets.length > 0) {
-          console.log(`Found ${snippets.length} relevant snippets from ${kb.name}`);
-          contextSnippets.push({
-            kbName: kb.name,
-            snippets: snippets
-          });
+          if (snippets && snippets.length > 0) {
+            console.log(`Found ${snippets.length} relevant snippets from ${kb.name}`);
+            contextSnippets.push({
+              kbName: kb.name,
+              snippets: snippets
+            });
+          }
         }
       }
     }
 
     // Construct the prompt based on whether we have context
     const prompt = constructPrompt(userMessage, contextSnippets);
-
+    if (finalConfig.model == "openai") {
+      return callOpenAI(prompt, finalConfig.openaiKey);
+    }
     // Call Ollama API with auth token
     console.log(`Sending prompt to ${finalConfig.model}...`);
     const response = await axios.post(`${OLLAMA_URL}/generate`, {
@@ -122,49 +191,89 @@ export const processChatStreaming = async (
     // For each selected knowledge base, fetch relevant snippets
     if (knowledgeBases && knowledgeBases.length > 0) {
       console.log(`Retrieving context from ${knowledgeBases.length} knowledge bases...`);
-
-      for (const kb of knowledgeBases) {
-        try {
+      if (finalConfig.combineSearch) {
+          const kb_ids = knowledgeBases.map(kb => kb.kb_id);
+          const names = knowledgeBases.map(kb => kb.name).join(",");
           // Search knowledge base for relevant snippets
-          const snippets = await searchKnowledgeBase(kb.id, userMessage, finalConfig.topK);
+          const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
 
           if (snippets && snippets.length > 0) {
-            console.log(`Found ${snippets.length} relevant snippets from ${kb.name}`);
+            console.log(`Found ${snippets.length} relevant snippets from ${names}`);
             contextSnippets.push({
-              kbName: kb.name,
+              kbName: names,
               snippets: snippets
             });
           }
-        } catch (error) {
-          console.error(`Error retrieving snippets from KB ${kb.name}:`, error);
-          // Continue with other knowledge bases if one fails
+      }
+      else {
+        for (const kb of knowledgeBases) {
+          try {
+            // Search knowledge base for relevant snippets
+            const snippets = await searchKnowledgeBase(kb.id, userMessage, finalConfig.topK);
+
+            if (snippets && snippets.length > 0) {
+              console.log(`Found ${snippets.length} relevant snippets from ${kb.name}`);
+              contextSnippets.push({
+                kbName: kb.name,
+                snippets: snippets
+              });
+            }
+          } catch (error) {
+            console.error(`Error retrieving snippets from KB ${kb.name}:`, error);
+            // Continue with other knowledge bases if one fails
+          }
         }
       }
     }
 
     // Construct the prompt based on whether we have context
     const prompt = constructPrompt(userMessage, contextSnippets);
-
-    // Start streaming request
-    const response = await fetch(`${OLLAMA_URL}/generate`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${localStorage.getItem('authToken')}`
-      },
-      body: JSON.stringify({
-        model: finalConfig.model,
-        prompt: prompt,
-        stream: true,
-        options: {
+    let response;
+    // --- OPENAI STREAMING PATH ---
+    if (finalConfig.model === 'openai') {
+      response = await fetch(OPENAI_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${finalConfig.openaiKey}`
+        },
+        body: JSON.stringify({
+          model: 'gpt-4.1-nano-2025-04-14',
+          messages: [
+            { role: 'system', content: 'You are a helpful assistant.' },
+            { role: 'user', content: prompt }
+          ],
+          stream: true,
           temperature: finalConfig.temperature,
           top_p: 0.9,
-          top_k: 40,
-          max_tokens: finalConfig.maxTokens,
-        }
-      }),
-      signal: abortController.signal
-    });
+          max_tokens: finalConfig.maxTokens
+        }),
+        signal: abortController.signal
+      });
+
+    }
+    else {
+      // Start streaming request
+      response = await fetch(`${OLLAMA_URL}/generate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        },
+        body: JSON.stringify({
+          model: finalConfig.model,
+          prompt: prompt,
+          stream: true,
+          options: {
+            temperature: finalConfig.temperature,
+            top_p: 0.9,
+            top_k: 40,
+            max_tokens: finalConfig.maxTokens,
+          }
+        }),
+        signal: abortController.signal
+      });
+    }
 
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({}));
@@ -192,13 +301,21 @@ export const processChatStreaming = async (
         
         try {
           // Ollama sends newline-delimited JSON objects
-          const lines = chunk.split('\n').filter(line => line.trim());
-          
+          const lines = chunk.replaceAll("data: ","").split('\n').filter(line => !line.includes("[DONE]") && line.trim());
           for (const line of lines) {
             const parsedChunk = JSON.parse(line);
-            
-            if (parsedChunk.response) {
-              const token = parsedChunk.response;
+            let token = "";
+            if(finalConfig.model === "openai" && (!response.data ||
+              !response.data.choices ||
+              !response.data.choices.length ||
+              !response.data.choices[0].message ||
+              !response.data.choices[0].message.content)){
+              token = parsedChunk.choices[0]?.delta?.content
+            }
+            if (finalConfig.model !== "openai" && parsedChunk.response) {
+              token = parsedChunk.response;
+            }
+            if(token && token != ""){
               fullResponse += token;
               
               // Call the token callback
