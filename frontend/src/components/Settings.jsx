@@ -16,13 +16,13 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
   useEffect(() => {
     const loadModels = async () => {
       try {
-        const response = await axios.get('http://localhost:6146/api/ollama/models');
+        const response = await axios.get('http://localhost:11434/api/tags');
         const models = response.data.models || [];
   
         const withIcons = models
-          .filter(modelName => modelName !== 'NAME')
-          .map(modelName => {
-            const cleanName = modelName.replace(':latest', '');
+          .filter(m => m.model !== 'NAME')
+          .map(m => {
+            const cleanName = m.model.replace(':latest', '');
             return {
               value: cleanName,
               label: cleanName,
@@ -38,6 +38,12 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
         })
         setModelOptions(withIcons);
       } catch (error) {
+        setModelOptions({
+          value: "openai",
+          label: "OpenAI",
+          description: "",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        })
         console.error('Failed to load models:', error);
       }
     };
