@@ -128,6 +128,31 @@ export const rebuildKnowledgeBase = async (id) => {
 };
 
 /**
+ * Search within Combine knowledge base
+ *
+ * @param {string} id - Knowledge base IDs
+ * @param {string} query - Search query
+ * @param {number} [topK=5] - Number of results to return
+ * @returns {Promise<Array>} - Array of search results
+ */
+export const searchCombineKnowledgeBase = async (ids, query, topK = 5) => {
+  try {
+    const response = await axios.post(
+      `${API_BASE_URL}/combineSearch`,
+      { kb_id: ids, query, top_k: topK },
+      {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        }
+      }
+    );
+    return response.data.results;
+  } catch (error) {
+    throw handleApiError(error, 'Failed to search knowledge base');
+  }
+};
+
+/**
  * Search within a specific knowledge base
  *
  * @param {string} id - Knowledge base ID
