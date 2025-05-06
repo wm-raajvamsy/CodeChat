@@ -11,7 +11,8 @@ import {
   getAllKnowledgeBases,
   removeKnowledgeBase,
   getApiStatus,
-  rebuildKnowledgeBase
+  rebuildKnowledgeBase,
+  getIndexingState
 } from './services/knowledgeBaseService';
 import {
   login,
@@ -47,7 +48,7 @@ const App = () => {
     temperature: 0.1,
     topK: 40,
     maxTokens: 1000,
-    model: 'qwen2.5:14b-instruct',
+    model: 'qwen2.5-coder:7b-instruct',
     streamingEnabled: true,
     combineSearch: false,
     openaiKey: ""
@@ -384,7 +385,24 @@ const App = () => {
 
     try {
       const kbs = await getAllKnowledgeBases();
-      setKnowledgeBases(kbs);
+      
+      // Fetch detailed indexing state for each knowledge base
+      const kbsWithState = await Promise.all(
+        Object.values(kbs).map(async (kb) => {
+          if (kb.status === 'indexing' || kb.status === 'pending') {
+            try {
+              const state = await getIndexingState(kb.id);
+              return { ...kb, ...state };
+            } catch (error) {
+              console.error(`Error fetching indexing state for ${kb.id}:`, error);
+              return kb;
+            }
+          }
+          return kb;
+        })
+      );
+
+      setKnowledgeBases(kbsWithState);
     } catch (err) {
       console.error('Error loading knowledge bases:', err);
       setError('Failed to load knowledge bases.');

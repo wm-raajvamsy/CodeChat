@@ -1,20 +1,32 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { FilePicker } from './FilePicker';
-import { SendIcon, PaperclipIcon } from 'lucide-react';
-import { TypingIndicator } from './TypingIndicator';
+import { processChat } from '../services/chatService';
 
 export const ChatInterface = ({
-  messages,
+  messages: initialMessages,
   onSendMessage,
-  isLoading,
-  selectedKnowledgeBases
+  isLoading: initialIsLoading,
+  selectedKnowledgeBases,
+  config
 }) => {
   const [input, setInput] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [uploadError, setUploadError] = useState(null);
+  const [messages, setMessages] = useState(initialMessages || []);
+  const [isLoading, setIsLoading] = useState(initialIsLoading || false);
+  const [searchProgress, setSearchProgress] = useState({});
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
+
+  // Update messages and loading state when props change
+  useEffect(() => {
+    setMessages(initialMessages || []);
+  }, [initialMessages]);
+
+  useEffect(() => {
+    setIsLoading(initialIsLoading || false);
+  }, [initialIsLoading]);
 
   // Auto-scroll to bottom when messages change
   useEffect(() => {
@@ -26,11 +38,37 @@ export const ChatInterface = ({
     inputRef.current?.focus();
   }, []);
 
-  const handleSubmit = (e) => {
+  const handleSearchProgress = (kbId, progress) => {
+    setSearchProgress(prev => ({
+      ...prev,
+      [kbId]: progress
+    }));
+  };
+
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (input.trim() && !isLoading) {
-      onSendMessage(input);
-      setInput('');
+    if (!input.trim()) return;
+
+    const userMessage = input;
+    setInput('');
+    setMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    setIsLoading(true);
+    setSearchProgress({});
+
+    try {
+      const response = await processChat(
+        userMessage,
+        selectedKnowledgeBases,
+        config,
+        handleSearchProgress
+      );
+      setMessages(prev => [...prev, { role: 'assistant', content: response }]);
+    } catch (error) {
+      console.error('Error:', error);
+      setMessages(prev => [...prev, { role: 'assistant', content: 'Sorry, there was an error processing your request.' }]);
+    } finally {
+      setIsLoading(false);
+      setSearchProgress({});
     }
   };
 
@@ -40,10 +78,9 @@ export const ChatInterface = ({
       return;
     }
 
-    const kbId = selectedKnowledgeBases[0].id;
     setIsUploading(true);
     setUploadError(null);
-
+    // File upload logic will be implemented here
   };
 
   return (
@@ -60,14 +97,31 @@ export const ChatInterface = ({
             <h2 className="text-xl font-medium mb-2">Start a conversation</h2>
             <p className="max-w-md">Ask questions about your code repositories or use the knowledge bases to get specific answers.</p>
           </div>
-        ) :
+        ) : (
           messages.map((msg, index) => (
             <ChatMessage key={index} message={msg} />
-          ))}
+          ))
+        )}
 
         {isLoading && (
-          <div className="ml-auto mr-auto">
-            <TypingIndicator />
+          <div className="flex justify-start">
+            <div className="bg-gray-700 text-gray-200 rounded-lg p-3">
+              <div className="flex items-center space-x-2">
+                <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                <span>Thinking...</span>
+              </div>
+              {Object.entries(searchProgress).map(([kbId, progress]) => (
+                <div key={kbId} className="mt-2">
+                  <div className="text-xs text-gray-400">{progress.current_operation}</div>
+                  <div className="w-full bg-gray-600 rounded-full h-1.5 mt-1">
+                    <div
+                      className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+                      style={{ width: `${progress.progress}%` }}
+                    ></div>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 

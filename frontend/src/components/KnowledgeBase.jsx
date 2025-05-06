@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { formatDate } from '../utils/helpers';
 import { isEmpty } from 'lodash';
-import { RefreshCw, GitBranch, Clock, Database, Tag, ExternalLink, Trash2, AlertTriangle, Plus } from 'lucide-react';
+import { RefreshCw, GitBranch, Clock, Database, Tag, ExternalLink, Trash2, AlertTriangle, Plus, Loader2 } from 'lucide-react';
 
 export default function KnowledgeBase({
   knowledgeBases = [],
@@ -41,6 +41,11 @@ export default function KnowledgeBase({
     onRemoveKnowledgeBase(id);
     setShowConfirmRemove(null);
   };
+
+  // Filter out any invalid or empty knowledge bases
+  const validKnowledgeBases = Array.isArray(knowledgeBases) 
+    ? knowledgeBases.filter(kb => kb && kb.id && kb.name)
+    : [];
 
   return (
     <div className="w-full mx-auto p-6 px-36 flex-col flex-1 overflow-scroll">
@@ -110,7 +115,7 @@ export default function KnowledgeBase({
       )}
 
       <div className="space-y-6">
-        {isEmpty(knowledgeBases) || knowledgeBases.length === 0 ? (
+        {isEmpty(validKnowledgeBases) ? (
           <div className="bg-gray-50 border-2 border-dashed border-gray-300 rounded-xl p-8 text-center">
             <div className="inline-block p-4 bg-gray-100 rounded-full mb-4">
               <Database size={24} className="text-gray-500" />
@@ -119,7 +124,7 @@ export default function KnowledgeBase({
             <p className="text-gray-500">Add a repository above to get started with your first knowledge base.</p>
           </div>
         ) : (
-          Object.values(knowledgeBases).map((kb) => {
+          validKnowledgeBases.map((kb) => {
             const isActive = selectedKnowledgeBases.some((s) => s.id === kb.id);
             const statusColor = kb.status === 'ready' ? 'bg-green-500' : 
                                kb.status === 'indexing' ? 'bg-yellow-500' : 'bg-gray-500';
@@ -188,15 +193,19 @@ export default function KnowledgeBase({
                       <GitBranch size={18} className="text-gray-500 mt-0.5 flex-shrink-0" />
                       <div>
                         <p className="text-sm font-medium text-gray-700">Repository</p>
-                        <a 
-                          href={kb.git_url} 
-                          target="_blank" 
-                          rel="noopener noreferrer" 
-                          className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1"
-                        >
-                          {kb.git_url}
-                          <ExternalLink size={14} />
-                        </a>
+                        {kb.git_url ? (
+                          <a 
+                            href={kb.git_url} 
+                            target="_blank" 
+                            rel="noopener noreferrer" 
+                            className="text-sm text-blue-600 hover:text-blue-800 flex items-center gap-1"
+                          >
+                            {kb.git_url}
+                            <ExternalLink size={14} />
+                          </a>
+                        ) : (
+                          <p className="text-sm text-gray-500">No repository URL</p>
+                        )}
                       </div>
                     </div>
                     
@@ -212,7 +221,10 @@ export default function KnowledgeBase({
                       <div className={`w-4 h-4 rounded-full ${statusColor} mt-0.5 flex-shrink-0`}></div>
                       <div>
                         <p className="text-sm font-medium text-gray-700">Status</p>
-                        <p className="text-sm text-gray-600">{kb.status}</p>
+                        <div className="flex items-center gap-2">
+                          <p className="text-sm text-gray-600 capitalize">{kb.status}</p>
+                          {kb.status === 'indexing' && <Loader2 size={14} className="animate-spin text-gray-500" />}
+                        </div>
                       </div>
                     </div>
                     
@@ -224,6 +236,79 @@ export default function KnowledgeBase({
                       </div>
                     </div>
                   </div>
+
+                  {/* Progress and Operation Status */}
+                  {(kb.status === 'indexing' || kb.status === 'pending') && (
+                    <div className="mt-4 space-y-2">
+                      <div className="flex justify-between items-center text-sm">
+                        <span className="text-gray-600">{kb.current_operation || 'Processing...'}</span>
+                        <span className="text-gray-600">{kb.progress}%</span>
+                      </div>
+                      <div className="w-full bg-gray-200 rounded-full h-2">
+                        <div 
+                          className="bg-blue-600 h-2 rounded-full transition-all duration-500"
+                          style={{ width: `${kb.progress}%` }}
+                        ></div>
+                      </div>
+
+                      {/* Detailed Indexing State */}
+                      {kb.indexing_details && (
+                        <div className="mt-4 p-4 bg-gray-50 rounded-lg border border-gray-200">
+                          <h4 className="text-sm font-medium text-gray-700 mb-3">Indexing Details</h4>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div>
+                              <p className="text-xs text-gray-500">Current Phase</p>
+                              <p className="text-sm font-medium text-gray-700">
+                                {kb.indexing_details.phase_descriptions?.[kb.indexing_details.current_phase] || kb.indexing_details.current_phase}
+                              </p>
+                            </div>
+                            <div>
+                              <p className="text-xs text-gray-500">Files Processed</p>
+                              <p className="text-sm font-medium text-gray-700">
+                                {kb.indexing_details.processed_files} / {kb.indexing_details.total_files}
+                              </p>
+                            </div>
+                            {kb.indexing_details.current_file && (
+                              <div className="col-span-2">
+                                <p className="text-xs text-gray-500">Current File</p>
+                                <p className="text-sm font-medium text-gray-700 truncate">
+                                  {kb.indexing_details.current_file}
+                                </p>
+                              </div>
+                            )}
+                            {kb.indexing_details.processed_files_list?.length > 0 && (
+                              <div className="col-span-2">
+                                <p className="text-xs text-gray-500">Recently Processed Files</p>
+                                <div className="mt-1 space-y-1">
+                                  {kb.indexing_details.processed_files_list.map((file, index) => (
+                                    <p key={index} className="text-xs text-gray-600 truncate">
+                                      {file}
+                                    </p>
+                                  ))}
+                                </div>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {/* Error Message */}
+                  {kb.status === 'error' && (
+                    <div className="mt-4 p-3 bg-red-50 rounded-lg">
+                      <div className="flex items-start gap-2">
+                        <AlertTriangle size={18} className="text-red-500 mt-0.5 flex-shrink-0" />
+                        <div>
+                          <p className="text-sm font-medium text-red-700">Error</p>
+                          <p className="text-sm text-red-600">{kb.error_message || 'An error occurred during processing'}</p>
+                          {kb.indexing_details?.last_error && (
+                            <p className="text-xs text-red-500 mt-1">{kb.indexing_details.last_error}</p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  )}
 
                   {kb.description && (
                     <div className="mt-4 text-sm text-gray-600">

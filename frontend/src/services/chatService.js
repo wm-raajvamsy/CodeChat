@@ -66,16 +66,17 @@ export async function callOpenAI(userMessage, openaiKey, contextSnippets = []) {
  * @param {string} userMessage - The user's message
  * @param {Array} knowledgeBases - Array of knowledge bases to use for context
  * @param {Object} config - Configuration for the chat (temperature, model, etc.)
+ * @param {function} onSearchProgress - Function to call for each search progress update
  * @returns {Promise<string>} - The assistant's response
  */
-export const processChat = async (userMessage, knowledgeBases = [], config = {}) => {
+export const processChat = async (userMessage, knowledgeBases = [], config = {}, onSearchProgress) => {
   try {
     // Default configuration
     const defaultConfig = {
       temperature: 0.7,
       topK: 5,
       maxTokens: 1000,
-      model: 'qwen2.5:14b-instruct',
+      model: 'qwen2.5-coder:7b-instruct',
     };
 
     // Merge with user config
@@ -93,18 +94,27 @@ export const processChat = async (userMessage, knowledgeBases = [], config = {})
         // Search knowledge base for relevant snippets
         const snippets = await searchCombineKnowledgeBase(kb_ids, userMessage, finalConfig.topK);
 
-          if (snippets && snippets.length > 0) {
-            console.log(`Found ${snippets.length} relevant snippets from ${names}`);
-            contextSnippets.push({
-              kbName: names,
-              snippets: snippets
-            });
-          }
+        if (snippets && snippets.length > 0) {
+          console.log(`Found ${snippets.length} relevant snippets from ${names}`);
+          contextSnippets.push({
+            kbName: names,
+            snippets: snippets
+          });
+        }
       }
       else {
         for (const kb of knowledgeBases) {
           // Search knowledge base for relevant snippets
-          const snippets = await searchKnowledgeBase(kb.id, userMessage, finalConfig.topK);
+          const snippets = await searchKnowledgeBase(
+            kb.id, 
+            userMessage, 
+            finalConfig.topK,
+            (progress) => {
+              if (onSearchProgress) {
+                onSearchProgress(kb.id, progress);
+              }
+            }
+          );
 
           if (snippets && snippets.length > 0) {
             console.log(`Found ${snippets.length} relevant snippets from ${kb.name}`);
@@ -147,7 +157,8 @@ export const processChat = async (userMessage, knowledgeBases = [], config = {})
 
     return response.data.response;
   } catch (error) {
-    throw handleApiError(error, 'Failed to process chat message');
+    console.error('Error in processChat:', error);
+    throw error;
   }
 };
 
@@ -179,7 +190,7 @@ export const processChatStreaming = async (
       temperature: 0.7,
       topK: 5,
       maxTokens: 1000,
-      model: 'qwen2.5:14b-instruct',
+      model: 'qwen2.5-coder:7b-instruct',
     };
 
     // Merge with user config

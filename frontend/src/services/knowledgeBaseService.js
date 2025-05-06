@@ -128,9 +128,79 @@ export const rebuildKnowledgeBase = async (id) => {
 };
 
 /**
- * Search within Combine knowledge base
+ * Get search progress for a knowledge base
+ * 
+ * @param {string} id - Knowledge base ID
+ * @returns {Promise<Object>} - Search progress information
+ */
+export const getSearchProgress = async (id) => {
+  try {
+    const response = await axios.get(
+      `${API_BASE_URL}/search-progress/${id}`,
+      {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        }
+      }
+    );
+    return response.data;
+  } catch (error) {
+    throw handleApiError(error, 'Failed to get search progress');
+  }
+};
+
+/**
+ * Search within a specific knowledge base
  *
- * @param {string} id - Knowledge base IDs
+ * @param {string} id - Knowledge base ID
+ * @param {string} query - Search query
+ * @param {number} [topK=5] - Number of results to return
+ * @param {Function} [onProgress] - Callback for progress updates
+ * @returns {Promise<Array>} - Array of search results
+ */
+export const searchKnowledgeBase = async (id, query, topK = 5, onProgress) => {
+  try {
+    // Start progress polling
+    let progressInterval;
+    if (onProgress) {
+      progressInterval = setInterval(async () => {
+        try {
+          const progress = await getSearchProgress(id);
+          onProgress(progress);
+          if (progress.status === 'complete' || progress.status === 'error') {
+            clearInterval(progressInterval);
+          }
+        } catch (error) {
+          console.error('Error polling search progress:', error);
+        }
+      }, 5000); // Poll every 5 seconds instead of 500ms
+    }
+
+    const response = await axios.post(
+      `${API_BASE_URL}/search`,
+      { kb_id: id, query, top_k: topK },
+      {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        }
+      }
+    );
+
+    // Clear progress polling
+    if (progressInterval) {
+      clearInterval(progressInterval);
+    }
+
+    return response.data.results;
+  } catch (error) {
+    throw handleApiError(error, 'Failed to search knowledge base');
+  }
+};
+
+/**
+ * Search across multiple knowledge bases
+ *
+ * @param {string[]} ids - Array of knowledge base IDs
  * @param {string} query - Search query
  * @param {number} [topK=5] - Number of results to return
  * @returns {Promise<Array>} - Array of search results
@@ -148,37 +218,12 @@ export const searchCombineKnowledgeBase = async (ids, query, topK = 5) => {
     );
     return response.data.results;
   } catch (error) {
-    throw handleApiError(error, 'Failed to search knowledge base');
+    throw handleApiError(error, 'Failed to search knowledge bases');
   }
 };
 
 /**
- * Search within a specific knowledge base
- *
- * @param {string} id - Knowledge base ID
- * @param {string} query - Search query
- * @param {number} [topK=5] - Number of results to return
- * @returns {Promise<Array>} - Array of search results
- */
-export const searchKnowledgeBase = async (id, query, topK = 5) => {
-  try {
-    const response = await axios.post(
-      `${API_BASE_URL}/search`,
-      { kb_id: id, query, top_k: topK },
-      {
-        headers: {
-          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
-        }
-      }
-    );
-    return response.data.results;
-  } catch (error) {
-    throw handleApiError(error, 'Failed to search knowledge base');
-  }
-};
-
-/**
- * Search across all ready knowledge bases
+ * Search across all active knowledge bases
  *
  * @param {string} query - Search query
  * @param {number} [topK=5] - Number of results to return
@@ -275,5 +320,26 @@ export const queryOllama = async (id, query, topK = 5, model = 'qwen2:14b-instru
     return response.data;
   } catch (error) {
     throw handleApiError(error, 'Failed to query Ollama');
+  }
+};
+
+/**
+ * Get detailed indexing state for a knowledge base
+ * @param {string} id - Knowledge base ID
+ * @returns {Promise<Object>} - Detailed indexing state information
+ */
+export const getIndexingState = async (id) => {
+  try {
+    const response = await axios.get(
+      `${API_BASE_URL}/knowledge-bases/${id}/indexing-state`,
+      {
+        headers: {
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        }
+      }
+    );
+    return response.data;
+  } catch (error) {
+    throw handleApiError(error, 'Failed to fetch indexing state');
   }
 };

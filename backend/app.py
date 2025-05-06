@@ -14,9 +14,38 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Any, Optional
 from InstructorEmbedding import INSTRUCTOR
 from tqdm import tqdm
+from code_analysis import CodeGraph, build_code_graph
+from progressive_search import ProgressiveSearch
+import logging
+from logging.handlers import RotatingFileHandler
+import threading
+from threading import Lock, Timer
+import signal
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+# Remove default Flask logger
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)
+
+# Custom logging filter to ignore status check logs
+class StatusCheckFilter(logging.Filter):
+    def filter(self, record):
+        return not (
+            'OPTIONS /api/knowledge-bases' in record.getMessage() or
+            'GET /api/knowledge-bases' in record.getMessage() or
+            'GET /api/status' in record.getMessage()
+        )
+
+# Apply filter to werkzeug logger
+log.addFilter(StatusCheckFilter())
 
 # Configuration
 INDEX_PATH = 'code_index.faiss'  # File with FAISS index
@@ -25,6 +54,7 @@ METADATA_PATH = 'code_metadata.pkl'  # File with metadata
 KB_PATH = 'knowledge_bases.json'  # Path to store knowledge base info
 UPLOADS_DIR = 'uploads'  # Directory to store uploaded files
 DATA_DIR = 'data'  # Directory to store indexed data per knowledge base
+GRAPH_PATH = 'code_graph.json'  # Path to store code graph
 
 QUERY_INSTRUCTION = "Represent the question for code retrieval:"
 INSTRUCTION = "Represent the code snippet for retrieval:"  # Base embedding instruction
@@ -50,6 +80,88 @@ EXCLUDED_PATTERNS = [
 # Global variables to hold the model and data
 instructor_model = None
 knowledge_bases = {}  # Dictionary to hold multiple knowledge bases
+code_graphs = {}  # Dictionary to hold code graphs for each knowledge base
+
+# Dictionary to store indexing threads
+indexing_threads = {}
+
+# Add after other global variables
+search_progress = {}
+search_progress_lock = Lock()
+
+# Add at the top with other imports
+SEARCH_TIMEOUT = 1200  # 2 minutes timeout for search operations
+
+def create_directory_if_not_exists(path):
+    """Create directory if it doesn't exist"""
+    try:
+        if not os.path.exists(path):
+            os.makedirs(path, exist_ok=True)
+            # Set permissions to ensure writability
+            os.chmod(path, 0o755)
+    except Exception as e:
+        print(f"Error creating directory {path}: {e}")
+        raise
+
+def get_kb_data_path(kb_id):
+    """Get the data path for a specific knowledge base"""
+    kb_dir = os.path.join(DATA_DIR, kb_id)
+    try:
+        create_directory_if_not_exists(kb_dir)
+        # Ensure directory is writable
+        test_file = os.path.join(kb_dir, '.test')
+        with open(test_file, 'w') as f:
+            f.write('test')
+        os.remove(test_file)
+        return kb_dir
+    except Exception as e:
+        print(f"Error creating/accessing data directory for {kb_id}: {e}")
+        raise
+
+def load_model():
+    """Load the Instructor embedding model"""
+    global instructor_model
+    print("Loading Instructor model...")
+    instructor_model = INSTRUCTOR('hkunlp/instructor-base')
+    print("Model loaded successfully!")
+    return instructor_model
+
+def load_knowledge_bases():
+    """Load the knowledge bases information from disk"""
+    global knowledge_bases
+    create_directory_if_not_exists(DATA_DIR)
+    
+    if os.path.exists(KB_PATH):
+        try:
+            with open(KB_PATH, 'r') as f:
+                knowledge_bases = json.load(f)
+                print(f"Loaded {len(knowledge_bases)} knowledge bases")
+        except Exception as e:
+            print(f"Error loading knowledge bases: {e}")
+            knowledge_bases = {}
+    else:
+        # Create empty knowledge bases file
+        with open(KB_PATH, 'w') as f:
+            json.dump({}, f)
+        knowledge_bases = {}
+    
+    return knowledge_bases
+
+# Initialize server
+def init_server():
+    """Initialize server by loading model and knowledge bases"""
+    # Create necessary directories
+    create_directory_if_not_exists(UPLOADS_DIR)
+    create_directory_if_not_exists(DATA_DIR)
+    
+    # Load knowledge bases
+    load_knowledge_bases()
+    
+    # Load model
+    load_model()
+
+# Initialize on startup
+init_server()
 
 # ========== CODE CHUNK CLASS ==========
 class CodeChunk:
@@ -129,50 +241,14 @@ def get_ollama_models_via_cli():
             models.append(parts[0])
     return models
 
-def create_directory_if_not_exists(path):
-    """Create directory if it doesn't exist"""
-    if not os.path.exists(path):
-        os.makedirs(path)
-
-def get_kb_data_path(kb_id):
-    """Get the data path for a specific knowledge base"""
-    kb_dir = os.path.join(DATA_DIR, kb_id)
-    create_directory_if_not_exists(kb_dir)
-    return kb_dir
-
-def load_model():
-    """Load the Instructor embedding model"""
-    global instructor_model
-    print("Loading Instructor model...")
-    instructor_model = INSTRUCTOR('hkunlp/instructor-base')
-    print("Model loaded successfully!")
-    return instructor_model
-
-def load_knowledge_bases():
-    """Load the knowledge bases information from disk"""
-    global knowledge_bases
-    create_directory_if_not_exists(DATA_DIR)
-    
-    if os.path.exists(KB_PATH):
-        try:
-            with open(KB_PATH, 'r') as f:
-                knowledge_bases = json.load(f)
-                print(f"Loaded {len(knowledge_bases)} knowledge bases")
-        except Exception as e:
-            print(f"Error loading knowledge bases: {e}")
-            knowledge_bases = {}
-    else:
-        # Create empty knowledge bases file
-        with open(KB_PATH, 'w') as f:
-            json.dump({}, f)
-        knowledge_bases = {}
-    
-    return knowledge_bases
-
 def save_knowledge_bases():
     """Save the knowledge bases information to disk"""
-    with open(KB_PATH, 'w') as f:
-        json.dump(knowledge_bases, f)
+    try:
+        with open(KB_PATH, 'w') as f:
+            json.dump(knowledge_bases, f)
+    except Exception as e:
+        print(f"Error saving knowledge bases: {e}")
+        raise
 
 def get_git_info(file_path: str) -> Dict:
     """Get git information for a file"""
@@ -212,11 +288,16 @@ def clone_git_repository(git_url: str, kb_id: str) -> str:
     create_directory_if_not_exists(repo_dir)
     
     try:
-        # Clone the repository
-        subprocess.run(["cp", "-rf", git_url, repo_dir], check=True)
+        # Check if the path is a local directory
+        if os.path.isdir(git_url):
+            # If it's a local directory, copy it
+            subprocess.run(["cp", "-rf", git_url, repo_dir], check=True)
+        else:
+            # If it's a git URL, clone it
+            subprocess.run(["git", "clone", git_url, repo_dir], check=True)
         return repo_dir
     except subprocess.SubprocessError as e:
-        print(f"Error cloning repository: {e}")
+        print(f"Error cloning/copying repository: {e}")
         raise
 
 def extract_imports(content: str, file_ext: str) -> List[str]:
@@ -240,15 +321,23 @@ def extract_imports(content: str, file_ext: str) -> List[str]:
 
 def should_exclude_path(path: str) -> bool:
     """Check if a path should be excluded based on patterns"""
+    path_parts = path.split(os.sep)
+    
     for pattern in EXCLUDED_PATTERNS:
         # Handle glob patterns
-        if pattern.startswith('*') and path.endswith(pattern[1:]):
-            return True
-        if pattern.endswith('*') and path.startswith(pattern[:-1]):
-            return True
-        # Direct match
-        elif pattern in path:
-            return True
+        if pattern.startswith('*'):
+            if path.endswith(pattern[1:]):
+                return True
+        elif pattern.endswith('*'):
+            if path.startswith(pattern[:-1]):
+                return True
+        else:
+            # Check if pattern matches any part of the path exactly
+            if any(part == pattern for part in path_parts):
+                return True
+            # Check if pattern is a file extension and path ends with it
+            if pattern.startswith('.') and path.endswith(pattern):
+                return True
     return False
 
 # ========== CODE PARSING FUNCTIONS ==========
@@ -511,8 +600,18 @@ def embed_codebase(repo_path: str, kb_id: str) -> Tuple[List[CodeChunk], np.ndar
     all_chunks = []
     supported_exts = [ext for exts in SUPPORTED_EXTENSIONS.values() for ext in exts]
     
+    # Update progress - Starting repository analysis
+    knowledge_bases[kb_id]['progress'] = 5
+    knowledge_bases[kb_id]['current_operation'] = 'Analyzing repository structure'
+    save_knowledge_bases()
+    
     # Extract repository structure
     repo_structure = extract_repository_structure(repo_path)
+    
+    # Update progress - Repository structure analyzed
+    knowledge_bases[kb_id]['progress'] = 10
+    knowledge_bases[kb_id]['current_operation'] = 'Creating repository overview'
+    save_knowledge_bases()
     
     # Create a repository overview chunk
     repo_name = os.path.basename(os.path.abspath(repo_path))
@@ -535,33 +634,44 @@ def embed_codebase(repo_path: str, kb_id: str) -> Tuple[List[CodeChunk], np.ndar
     )
     all_chunks.append(overview_chunk)
     
+    # Update progress - Starting file processing
+    knowledge_bases[kb_id]['progress'] = 15
+    knowledge_bases[kb_id]['current_operation'] = 'Processing files'
+    save_knowledge_bases()
+    
+    # Get total number of files for progress calculation (excluding excluded paths)
+    total_files = 0
+    for root, _, files in os.walk(repo_path):
+        rel_root = os.path.relpath(root, repo_path)
+        if should_exclude_path(rel_root):
+            continue
+        for f in files:
+            if any(f.endswith(ext) for ext in supported_exts):
+                rel_path = os.path.join(rel_root, f)
+                if not should_exclude_path(rel_path):
+                    total_files += 1
+    
+    processed_files = 0
+    
     # Process each file
     for root, dirs, files in os.walk(repo_path):
-        # Skip hidden directories and files
-        if any(part.startswith('.') for part in Path(root).parts):
-            continue
-            
         # Skip excluded directories
         rel_root = os.path.relpath(root, repo_path)
         if should_exclude_path(rel_root):
-            dirs[:] = []  # Skip all subdirectories
+            dirs.clear()  # Clear dirs list to prevent walking into excluded directories
             continue
             
-        # Modify dirs in-place to skip excluded directories
-        dirs[:] = [d for d in dirs if not should_exclude_path(d) and not should_exclude_path(os.path.join(rel_root, d))]
+        # Filter out excluded directories
+        dirs[:] = [d for d in dirs if not should_exclude_path(os.path.join(rel_root, d))]
             
         for fname in files:
             # Skip excluded files
-            if should_exclude_path(fname):
+            rel_path = os.path.join(rel_root, fname)
+            if should_exclude_path(rel_path):
                 continue
                 
             if any(fname.endswith(ext) for ext in supported_exts):
                 fpath = os.path.join(root, fname)
-                rel_path = os.path.relpath(fpath, repo_path)
-                
-                # Skip excluded paths
-                if should_exclude_path(rel_path):
-                    continue
                 
                 try:
                     with open(fpath, 'r', encoding='utf-8', errors='ignore') as f:
@@ -582,30 +692,51 @@ def embed_codebase(repo_path: str, kb_id: str) -> Tuple[List[CodeChunk], np.ndar
                     file_chunks = parse_generic_file(rel_path, content)
                 
                 all_chunks.extend(file_chunks)
+                
+                # Update progress for file processing
+                processed_files += 1
+                file_progress = 15 + (processed_files / total_files * 40)  # 15-55%
+                knowledge_bases[kb_id]['progress'] = int(file_progress)
+                knowledge_bases[kb_id]['current_operation'] = f'Processing files ({processed_files}/{total_files})'
+                save_knowledge_bases()
     
-    print(f"Extracted {len(all_chunks)} code chunks for knowledge base {kb_id}")
+    # Update progress - Starting embedding
+    knowledge_bases[kb_id]['progress'] = 55
+    knowledge_bases[kb_id]['current_operation'] = 'Generating embeddings'
+    save_knowledge_bases()
     
     # Prepare for embedding
     embedding_texts = [chunk.get_embedding_text() for chunk in all_chunks]
     
     # Prepare instruction-text pairs
     inputs = [[INSTRUCTION, text] for text in embedding_texts]
-    print(f"Embedding {len(inputs)} chunks with Instructor model...")
     
     # Embed in batches to avoid memory issues
     batch_size = 32
     all_embeddings = []
+    total_batches = (len(inputs) + batch_size - 1) // batch_size
     
     for i in tqdm(range(0, len(inputs), batch_size)):
         batch = inputs[i:i+batch_size]
         batch_embeddings = instructor_model.encode(batch, show_progress_bar=False)
         all_embeddings.append(batch_embeddings)
+        
+        # Update progress for embedding
+        batch_progress = 55 + ((i // batch_size + 1) / total_batches * 40)  # 55-95%
+        knowledge_bases[kb_id]['progress'] = int(batch_progress)
+        knowledge_bases[kb_id]['current_operation'] = f'Generating embeddings ({i + len(batch)}/{len(inputs)})'
+        save_knowledge_bases()
     
     # Combine all embeddings
     embeddings = np.vstack(all_embeddings).astype('float32')
     
     # Normalize for cosine similarity
     faiss.normalize_L2(embeddings)
+    
+    # Update progress - Completed
+    knowledge_bases[kb_id]['progress'] = 95
+    knowledge_bases[kb_id]['current_operation'] = 'Finalizing'
+    save_knowledge_bases()
     
     return all_chunks, embeddings
 
@@ -794,57 +925,111 @@ def status():
     if instructor_model is None:
         return jsonify({"status": "warming_up", "message": "Model is still loading"}), 503
     
+    # Get status of all knowledge bases
+    kb_statuses = {}
+    for kb_id, kb_info in knowledge_bases.items():
+        kb_statuses[kb_id] = {
+            "status": kb_info.get("status", "unknown"),
+            "name": kb_info.get("name", ""),
+            "chunkCount": kb_info.get("chunkCount", 0),
+            "lastModified": kb_info.get("lastModified", ""),
+            "progress": kb_info.get("progress", 0),
+            "current_operation": kb_info.get("current_operation", "")
+        }
+    
     return jsonify({
         "status": "ok",
         "model": "instructor-base",
-        "knowledge_bases": len(knowledge_bases),
-        "supported_extensions": SUPPORTED_EXTENSIONS
+        "knowledge_bases": kb_statuses
     })
+
+def update_search_progress(kb_id: str, progress: int, operation: str):
+    """Update search progress for a knowledge base"""
+    with search_progress_lock:
+        search_progress[kb_id] = {
+            'progress': progress,
+            'current_operation': operation,
+            'status': 'searching'
+        }
+
+@app.route('/api/search-progress/<kb_id>', methods=['GET'])
+def get_search_progress(kb_id: str):
+    """Get current search progress for a knowledge base"""
+    with search_progress_lock:
+        return jsonify(search_progress.get(kb_id, {'status': 'not_found'}))
 
 @app.route('/api/search', methods=['POST'])
 def search():
-    """Search the code index for relevant snippets"""
-    if instructor_model is None:
-        return jsonify({"error": "Server is still initializing"}), 503
-    
-    # Get request data
-    data = request.json
-    if not data:
-        return jsonify({"error": "No data provided"}), 400
-    
-    query = data.get('query')
-    kb_id = data.get('kb_id')
-    top_k = data.get('top_k', 5)
-    
-    if not query:
-        return jsonify({"error": "No query provided"}), 400
-    
+    """Enhanced search endpoint using progressive search"""
     try:
-        # If kb_id is provided, search only that knowledge base
-        if kb_id:
-            if kb_id not in knowledge_bases:
-                return jsonify({"error": f"Knowledge base {kb_id} not found"}), 404
+        data = request.json
+        query = data.get('query')
+        kb_id = data.get('kb_id')
+        
+        if not query or not kb_id:
+            return jsonify({'error': 'Missing query or kb_id'}), 400
+        
+        if kb_id not in knowledge_bases:
+            return jsonify({'error': 'Knowledge base not found'}), 404
+        
+        # Initialize progress
+        update_search_progress(kb_id, 0, "Starting search")
+        
+        # Load code graph if not in memory
+        if kb_id not in code_graphs:
+            update_search_progress(kb_id, 20, "Loading code graph")
+            graph_path = os.path.join(get_kb_data_path(kb_id), GRAPH_PATH)
+            if os.path.exists(graph_path):
+                code_graphs[kb_id] = CodeGraph.load(graph_path)
+            else:
+                update_search_progress(kb_id, 0, "Error: Code graph not found")
+                return jsonify({'error': 'Code graph not found. Please index the knowledge base first.'}), 404
+        
+        # Initialize progressive search
+        update_search_progress(kb_id, 40, "Initializing search engine")
+        search_engine = ProgressiveSearch(code_graphs[kb_id], instructor_model)
+        
+        # Set up progress callback
+        def progress_callback(progress: int, operation: str):
+            update_search_progress(kb_id, progress, operation)
+        
+        search_engine.set_progress_callback(progress_callback)
+        
+        # Set up timeout
+        search_completed = threading.Event()
+        search_error = [None]  # Use list to store error message
+        
+        def timeout_handler():
+            if not search_completed.is_set():
+                search_error[0] = "Search operation timed out"
+                search_completed.set()
+        
+        timer = Timer(SEARCH_TIMEOUT, timeout_handler)
+        timer.start()
+        
+        try:
+            # Perform search
+            update_search_progress(kb_id, 60, "Performing search")
+            results = search_engine.search(query)
+            search_completed.set()
             
-            results = search_kb(kb_id, query, top_k)
-            return jsonify({"results": results})
+            if search_error[0]:
+                raise Exception(search_error[0])
+            
+            return jsonify({
+                'results': results,
+                'query': query,
+                'kb_id': kb_id
+            })
+            
+        finally:
+            timer.cancel()
         
-        # If no kb_id, search all knowledge bases
-        all_results = []
-        for kb_id in knowledge_bases:
-            kb_results = search_kb(kb_id, query, top_k)
-            for result in kb_results:
-                result['kb_id'] = kb_id
-            all_results.extend(kb_results)
-        
-        # Sort by score
-        all_results = sorted(all_results, key=lambda x: x['score'], reverse=True)[:top_k]
-        
-        return jsonify({"results": all_results})
-    
     except Exception as e:
-        print(f"Error during search: {e}")
+        print(f"Error in search: {str(e)}")
         traceback.print_exc()
-        return jsonify({"error": f"Search failed: {str(e)}"}), 500
+        update_search_progress(kb_id, 0, f"Error: {str(e)}")
+        return jsonify({'error': str(e)}), 500
 
 @app.route('/api/upload', methods=['POST'])
 def upload_file():
@@ -921,18 +1106,46 @@ def upload_file():
 
 @app.route('/api/knowledge-bases', methods=['GET'])
 def list_knowledge_bases():
-    """List all knowledge bases"""
-    return jsonify({"knowledge_bases": knowledge_bases})
+    """List all knowledge bases with their current status"""
+    # Cache the response for 1 second to reduce load
+    current_time = time.time()
+    if not hasattr(list_knowledge_bases, 'last_response') or \
+       current_time - list_knowledge_bases.last_time > 1:
+        kb_list = {}
+        for kb_id, kb_info in knowledge_bases.items():
+            # Check if thread is still alive for indexing knowledge bases
+            if kb_id in indexing_threads and kb_info['status'] == 'indexing':
+                if not indexing_threads[kb_id].is_alive():
+                    kb_info['status'] = 'error'
+                    kb_info['error_message'] = 'Indexing process failed'
+                    kb_info['current_operation'] = 'Error: Indexing process failed'
+                    save_knowledge_bases()
+            
+            kb_list[kb_id] = {
+                "id": kb_id,
+                "name": kb_info.get("name", ""),
+                "description": kb_info.get("description", ""),
+                "status": kb_info.get("status", "unknown"),
+                "chunkCount": kb_info.get("chunkCount", 0),
+                "lastModified": kb_info.get("lastModified", ""),
+                "progress": kb_info.get("progress", 0),
+                "current_operation": kb_info.get("current_operation", "")
+            }
+        list_knowledge_bases.last_response = {"knowledge_bases": kb_list}
+        list_knowledge_bases.last_time = current_time
+    
+    return jsonify(list_knowledge_bases.last_response)
 
 @app.route('/api/knowledge-bases', methods=['POST'])
 def create_knowledge_base():
     """Create a new knowledge base from a Git repository"""
+    logger = logging.getLogger('api')
     data = request.json
     if not data:
         return jsonify({"error": "No data provided"}), 400
     
     name = data.get('name')
-    git_url = data.get('git_url')  # New field for Git repository URL
+    git_url = data.get('git_url')
     
     if not name:
         return jsonify({"error": "Knowledge base name is required"}), 400
@@ -942,32 +1155,67 @@ def create_knowledge_base():
     
     # Generate a unique ID
     kb_id = f"kb_{int(time.time())}"
+    logger.info(f"Creating new knowledge base {kb_id} with name {name}")
     
-    # Create knowledge base entry
-    knowledge_bases[kb_id] = {
-        "id": kb_id,
-        "name": name,
-        "description": data.get('description', ''),
-        "git_url": git_url,  # Store the Git URL
-        "created": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-        "lastModified": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
-        "chunkCount": 0,
-        "status": "pending"  # pending, indexing, ready, error
-    }
-    
-    # Create directory for knowledge base
-    kb_dir = get_kb_data_path(kb_id)
-    create_directory_if_not_exists(kb_dir)
-    
-    # Save knowledge bases info
-    save_knowledge_bases()
-    index_knowledge_base(kb_id)
-    return jsonify({
-        "message": "Knowledge base created successfully",
-        "kb_id": kb_id,
-        "kb_info": knowledge_bases[kb_id]
-    })
-    
+    try:
+        # Create knowledge base entry
+        knowledge_bases[kb_id] = {
+            "id": kb_id,
+            "name": name,
+            "description": data.get('description', ''),
+            "git_url": git_url,
+            "created": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            "lastModified": time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+            "chunkCount": 0,
+            "status": "pending",
+            "progress": 0,
+            "current_operation": "Initializing"
+        }
+        
+        # Create directory for knowledge base
+        kb_dir = get_kb_data_path(kb_id)
+        create_directory_if_not_exists(kb_dir)
+        logger.info(f"Created directory structure for {kb_id}")
+        
+        # Save knowledge bases info
+        save_knowledge_bases()
+        
+        # Copy/clone the repository
+        logger.info(f"Copying/cloning repository from {git_url} to {kb_id}")
+        knowledge_bases[kb_id]['current_operation'] = 'Copying repository'
+        knowledge_bases[kb_id]['progress'] = 10
+        save_knowledge_bases()
+        
+        repo_path = clone_git_repository(git_url, kb_id)
+        logger.info(f"Repository copied/cloned successfully to {repo_path}")
+        
+        # Start indexing in background thread
+        logger.info(f"Starting indexing thread for {kb_id}")
+        indexing_thread = threading.Thread(
+            target=index_knowledge_base_async,
+            args=(kb_id,),
+            daemon=True
+        )
+        indexing_threads[kb_id] = indexing_thread
+        indexing_thread.start()
+        
+        response = {
+            "message": "Knowledge base creation started",
+            "kb_id": kb_id,
+            "kb_info": knowledge_bases[kb_id]
+        }
+        logger.info(f"Knowledge base creation initiated for {kb_id}")
+        return jsonify(response)
+        
+    except Exception as e:
+        logger.error(f"Error creating knowledge base {kb_id}: {str(e)}")
+        logger.error(traceback.format_exc())
+        # Clean up if something went wrong
+        if kb_id in knowledge_bases:
+            del knowledge_bases[kb_id]
+            save_knowledge_bases()
+        return jsonify({"error": f"Error creating knowledge base: {str(e)}"}), 500
+
 @app.route('/api/knowledge-bases/<kb_id>', methods=['GET'])
 def get_knowledge_base(kb_id):
     """Get information about a specific knowledge base"""
@@ -1023,78 +1271,63 @@ def delete_knowledge_base(kb_id):
 
 @app.route('/api/knowledge-bases/<kb_id>/index', methods=['POST'])
 def index_knowledge_base(kb_id):
-    """Index a knowledge base from its Git repository"""
-    if kb_id not in knowledge_bases:
-        return jsonify({"error": f"Knowledge base {kb_id} not found"}), 404
-    
-    # Get Git URL from knowledge base info
-    git_url = knowledge_bases[kb_id].get('git_url')
-    if not git_url:
-        return jsonify({"error": "No Git URL found for this knowledge base"}), 400
-    
-    # Update status to indexing
-    knowledge_bases[kb_id]['status'] = 'indexing'
-    save_knowledge_bases()
-    
+    """Enhanced index endpoint that builds code graph"""
     try:
-        # Start indexing in a background thread to avoid blocking
-        import threading
-        def index_background():
-            try:
-                if instructor_model is None:
-                    load_model()
-                
-                # Clone the Git repository
-                try:
-                    repo_path = clone_git_repository(git_url, kb_id)
-                except Exception as e:
-                    print(f"Error cloning repository: {e}")
-                    knowledge_bases[kb_id]['status'] = 'error'
-                    knowledge_bases[kb_id]['error'] = f"Git clone failed: {str(e)}"
-                    save_knowledge_bases()
-                    return
-                
-                # Embed the codebase
-                chunks, embeddings = embed_codebase(repo_path, kb_id)
-                
-                # Build FAISS index
-                index = build_faiss_index(embeddings)
-                
-                # Save to disk
-                save_embeddings(kb_id, chunks, index)
-                
-                # Update knowledge base status
-                knowledge_bases[kb_id]['status'] = 'ready'
-                knowledge_bases[kb_id]['chunkCount'] = len(chunks)
-                knowledge_bases[kb_id]['lastModified'] = time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())
-                save_knowledge_bases()
-                
-                print(f"Indexing completed for {kb_id} with {len(chunks)} chunks")
-                
-            except Exception as e:
-                print(f"Error indexing knowledge base {kb_id}: {e}")
-                traceback.print_exc()
-                knowledge_bases[kb_id]['status'] = 'error'
-                knowledge_bases[kb_id]['error'] = str(e)
-                save_knowledge_bases()
+        if kb_id not in knowledge_bases:
+            return jsonify({'error': 'Knowledge base not found'}), 404
         
-        # Start background thread
-        thread = threading.Thread(target=index_background)
-        thread.daemon = True
-        thread.start()
+        repo_path = os.path.join(UPLOADS_DIR, kb_id)
+        if not os.path.exists(repo_path):
+            return jsonify({'error': 'Repository not found'}), 404
+        
+        # Check if already indexing
+        if kb_id in indexing_threads and indexing_threads[kb_id].is_alive():
+            return jsonify({'error': 'Knowledge base is already being indexed'}), 409
+        
+        # Update status to indexing
+        knowledge_bases[kb_id]['status'] = 'indexing'
+        knowledge_bases[kb_id]['progress'] = 0
+        knowledge_bases[kb_id]['current_operation'] = 'Starting indexing process'
+        knowledge_bases[kb_id]['indexing_state'] = {
+            'current_file': None,
+            'processed_files': 0,
+            'total_files': 0,
+            'current_phase': 'initialization',
+            'last_successful_phase': None,
+            'processed_files_list': []
+        }
+        save_knowledge_bases()
+        
+        # Start indexing in background thread
+        indexing_thread = threading.Thread(
+            target=index_knowledge_base_async,
+            args=(kb_id,),
+            daemon=True
+        )
+        indexing_threads[kb_id] = indexing_thread
+        indexing_thread.start()
         
         return jsonify({
-            "message": f"Indexing started for knowledge base {kb_id}",
-            "status": "indexing"
+            'message': 'Indexing started successfully',
+            'kb_id': kb_id,
+            'status': knowledge_bases[kb_id]
         })
         
     except Exception as e:
-        print(f"Error starting indexing for {kb_id}: {e}")
+        print(f"Error starting indexing for {kb_id}: {str(e)}")
         traceback.print_exc()
-        knowledge_bases[kb_id]['status'] = 'error'
-        knowledge_bases[kb_id]['error'] = str(e)
-        save_knowledge_bases()
-        return jsonify({"error": f"Error starting indexing: {str(e)}"}), 500
+        
+        # Update knowledge base status
+        if kb_id in knowledge_bases:
+            knowledge_bases[kb_id]['status'] = 'error'
+            knowledge_bases[kb_id]['error_message'] = str(e)
+            save_knowledge_bases()
+            
+        return jsonify({
+            'error': f'Error starting indexing: {str(e)}',
+            'kb_id': kb_id,
+            'status': knowledge_bases.get(kb_id, {})
+        }), 500
 
 @app.route('/api/ollama/<kb_id>', methods=['POST'])
 def query_ollama(kb_id):
@@ -1122,14 +1355,28 @@ def query_ollama(kb_id):
         if not snippets:
             return jsonify({"error": "No relevant code snippets found"}), 404
         
-        # Format snippets for Ollama
+        # Format snippets for Ollama with better context
         formatted_snippets = []
         for idx, snippet in enumerate(snippets, 1):
-            # Format snippet with metadata
-            formatted = f"[SNIPPET {idx}] {snippet['file_path']} ({snippet['chunk_type']} {snippet['name']})\n"
-            if snippet['metadata']['dependencies']:
+            # Get file extension and type
+            file_ext = os.path.splitext(snippet['file_path'])[1]
+            file_type = "JavaScript" if file_ext in ['.js', '.jsx'] else "TypeScript" if file_ext in ['.ts', '.tsx'] else "Other"
+            
+            # Format snippet with enhanced metadata
+            formatted = f"[SNIPPET {idx}] {snippet['file_path']}\n"
+            formatted += f"Type: {file_type}\n"
+            formatted += f"Chunk Type: {snippet['chunk_type']}\n"
+            if snippet.get('name'):
+                formatted += f"Name: {snippet['name']}\n"
+            if snippet['metadata'].get('dependencies'):
                 formatted += f"Dependencies: {', '.join(snippet['metadata']['dependencies'])}\n"
-            formatted += f"\n{snippet['content']}\n"
+            if snippet['metadata'].get('git_info'):
+                git_info = snippet['metadata']['git_info']
+                if git_info.get('last_modified'):
+                    formatted += f"Last Modified: {git_info['last_modified']}\n"
+                if git_info.get('commit_msg'):
+                    formatted += f"Commit Message: {git_info['commit_msg']}\n"
+            formatted += f"\nCode:\n```{file_ext[1:] if file_ext else ''}\n{snippet['content']}\n```\n"
             formatted_snippets.append(formatted)
         
         context = "\n\n".join(formatted_snippets)
@@ -1145,6 +1392,7 @@ Based on the above code snippets from the repository, please answer the followin
 
 Provide a clear and concise answer, referencing specific parts of the code when needed.
 If you're unsure about something, acknowledge the uncertainty rather than making assumptions.
+If the answer requires code examples, always format code blocks properly using markdown syntax.
 """
 
         # Configure Ollama endpoint
@@ -1155,9 +1403,10 @@ If you're unsure about something, acknowledge the uncertainty rather than making
             "prompt": prompt,
             "stream": False,
             "options": {
-                "temperature": 0.2,
+                "temperature": 0.2,  # Reduced for more focused answers
                 "top_p": 0.9,
-                "top_k": 40
+                "top_k": 40,
+                "max_tokens": 1000
             }
         }
         
@@ -1208,6 +1457,81 @@ def knowledge_base_stats(kb_id):
         print(f"Error getting stats for {kb_id}: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Error getting stats: {str(e)}"}), 500
+
+@app.route('/api/knowledge-bases/<kb_id>/indexing-state', methods=['GET'])
+def get_indexing_state(kb_id):
+    """Get detailed information about the current indexing state"""
+    if kb_id not in knowledge_bases:
+        return jsonify({"error": "Knowledge base not found"}), 404
+    
+    kb = knowledge_bases[kb_id]
+    
+    # Get basic knowledge base info
+    state = {
+        "id": kb_id,
+        "name": kb.get("name", ""),
+        "status": kb.get("status", "unknown"),
+        "progress": kb.get("progress", 0),
+        "current_operation": kb.get("current_operation", ""),
+        "lastModified": kb.get("lastModified", ""),
+        "error_message": kb.get("error_message", None)
+    }
+    
+    # Add detailed indexing state if available
+    if "indexing_state" in kb:
+        indexing_state = kb["indexing_state"]
+        state["indexing_details"] = {
+            "current_phase": indexing_state.get("current_phase", "unknown"),
+            "current_file": indexing_state.get("current_file", None),
+            "processed_files": indexing_state.get("processed_files", 0),
+            "total_files": indexing_state.get("total_files", 0),
+            "last_successful_phase": indexing_state.get("last_successful_phase", None),
+            "last_error": indexing_state.get("last_error", None),
+            "processed_files_list": indexing_state.get("processed_files_list", [])[-10:]  # Last 10 files
+        }
+        
+        # Calculate additional metrics
+        if indexing_state.get("total_files", 0) > 0:
+            state["indexing_details"]["completion_percentage"] = round(
+                (indexing_state.get("processed_files", 0) / indexing_state.get("total_files", 0)) * 100, 2
+            )
+        
+        # Add phase descriptions
+        state["indexing_details"]["phase_descriptions"] = {
+            "initialization": "Setting up indexing process",
+            "building_graph": "Building code dependency graph",
+            "processing_files": "Processing and analyzing files",
+            "saving_graph": "Saving code graph to disk",
+            "completed": "Indexing completed successfully"
+        }
+    
+    # Add thread information if indexing is in progress
+    if kb_id in indexing_threads:
+        thread = indexing_threads[kb_id]
+        state["thread_info"] = {
+            "is_alive": thread.is_alive(),
+            "is_daemon": thread.daemon,
+            "name": thread.name
+        }
+    
+    # Add file system information
+    kb_path = os.path.join(UPLOADS_DIR, kb_id)
+    if os.path.exists(kb_path):
+        state["file_system"] = {
+            "exists": True,
+            "size": sum(os.path.getsize(os.path.join(dirpath,filename)) 
+                       for dirpath, dirnames, filenames in os.walk(kb_path) 
+                       for filename in filenames),
+            "file_count": sum(len(files) for _, _, files in os.walk(kb_path)),
+            "has_progress_file": os.path.exists(os.path.join(kb_path, 'indexing_progress.json')),
+            "has_graph_file": os.path.exists(os.path.join(kb_path, GRAPH_PATH))
+        }
+    else:
+        state["file_system"] = {
+            "exists": False
+        }
+    
+    return jsonify(state)
 
 # Serve static files from the frontend directory
 @app.route('/', defaults={'path': ''})
@@ -1305,6 +1629,318 @@ def search_all():
         print(f"Error during search: {e}")
         traceback.print_exc()
         return jsonify({"error": f"Search failed: {str(e)}"}), 500
+
+def index_knowledge_base_async(kb_id: str, resume_from: str = None):
+    """Background thread function to handle indexing with resume capability"""
+    try:
+        print(f"Starting indexing process for knowledge base {kb_id}")
+        kb = knowledge_bases.get(kb_id)
+        if not kb:
+            print(f"Knowledge base {kb_id} not found")
+            return
+
+        # Update status to indexing
+        kb['status'] = 'indexing'
+        kb['progress'] = 0
+        kb['current_operation'] = 'Starting repository analysis'
+        kb['indexing_state'] = {
+            'current_file': None,
+            'processed_files': 0,
+            'total_files': 0,
+            'current_phase': 'initialization',
+            'last_successful_phase': None
+        }
+        save_knowledge_bases()
+
+        # Set a longer timeout for code graph building (15 minutes)
+        timeout_seconds = 900  # 15 minutes
+        timeout_occurred = [False]
+
+        def timeout_handler():
+            timeout_occurred[0] = True
+            print(f"Timeout while building code graph for {kb_id}")
+            kb['status'] = 'error'
+            kb['error_message'] = 'Code graph building timed out after 15 minutes. The repository might be too large or complex.'
+            save_knowledge_bases()
+
+        # Start the timeout timer
+        timer = Timer(timeout_seconds, timeout_handler)
+        timer.start()
+
+        try:
+            kb_path = os.path.join(UPLOADS_DIR, kb_id)
+            if not os.path.exists(kb_path):
+                raise Exception(f"Repository path {kb_path} does not exist")
+
+            # Initialize or load progress tracking
+            if resume_from and os.path.exists(os.path.join(kb_path, 'indexing_progress.json')):
+                with open(os.path.join(kb_path, 'indexing_progress.json'), 'r') as f:
+                    progress_data = json.load(f)
+                    kb['indexing_state'].update(progress_data)
+                    print(f"Resuming indexing from phase: {progress_data['current_phase']}")
+            else:
+                # Calculate total files for progress tracking (excluding node_modules and other excluded paths)
+                total_files = 0
+                for root, _, files in os.walk(kb_path):
+                    rel_root = os.path.relpath(root, kb_path)
+                    if should_exclude_path(rel_root):
+                        continue
+                    for file in files:
+                        if file.endswith(('.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.h', '.hpp')):
+                            rel_path = os.path.join(rel_root, file)
+                            if not should_exclude_path(rel_path):
+                                total_files += 1
+                kb['indexing_state']['total_files'] = total_files
+
+            # Build code graph with progress updates
+            kb['current_operation'] = 'Building code graph'
+            kb['progress'] = 10
+            kb['indexing_state']['current_phase'] = 'building_graph'
+            save_knowledge_bases()
+
+            graph = {
+                'nodes': [],  # Files and dependencies
+                'edges': [],   # Import relationships
+                'file_contents': {}  # Store file contents
+            }
+
+            # Process files with resume capability
+            for root, dirs, files in os.walk(kb_path):
+                # Skip excluded directories
+                rel_root = os.path.relpath(root, kb_path)
+                if should_exclude_path(rel_root):
+                    dirs.clear()  # Clear dirs list to prevent walking into excluded directories
+                    continue
+
+                # Filter out excluded directories
+                dirs[:] = [d for d in dirs if not should_exclude_path(os.path.join(rel_root, d))]
+
+                for file in files:
+                    if file.endswith(('.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.cpp', '.h', '.hpp')):
+                        file_path = os.path.join(root, file)
+                        relative_path = os.path.relpath(file_path, kb_path)
+                        
+                        # Skip excluded files
+                        if should_exclude_path(relative_path):
+                            continue
+                        
+                        # Skip already processed files if resuming
+                        if resume_from and relative_path in kb['indexing_state'].get('processed_files_list', []):
+                            continue
+
+                        # Update current file being processed
+                        kb['indexing_state']['current_file'] = relative_path
+                        kb['current_operation'] = f'Processing {relative_path}'
+                        
+                        # Add file node
+                        graph['nodes'].append({
+                            'id': relative_path,
+                            'type': 'file',
+                            'name': file
+                        })
+
+                        try:
+                            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                                content = f.read()
+                                
+                            # Store file content
+                            graph['file_contents'][relative_path] = content
+
+                            # Extract imports based on file type
+                            if file.endswith(('.py')):
+                                # Python imports
+                                import_pattern = r'^(?:from\s+(\S+)\s+import\s+|import\s+(\S+))'
+                                for line in content.split('\n'):
+                                    match = re.match(import_pattern, line.strip())
+                                    if match:
+                                        imported = match.group(1) or match.group(2)
+                                        # Handle relative imports
+                                        if imported.startswith('.'):
+                                            imported = os.path.normpath(os.path.join(os.path.dirname(relative_path), imported))
+                                        graph['edges'].append({
+                                            'source': relative_path,
+                                            'target': imported,
+                                            'type': 'imports'
+                                        })
+                            elif file.endswith(('.js', '.jsx', '.ts', '.tsx')):
+                                # JavaScript/TypeScript imports
+                                import_patterns = [
+                                    r'^import\s+(?:\*\s+as\s+\w+\s+from\s+)?[\'"]([^\'"]+)[\'"]',
+                                    r'^import\s+{[^}]+}\s+from\s+[\'"]([^\'"]+)[\'"]',
+                                    r'^import\s+\w+\s+from\s+[\'"]([^\'"]+)[\'"]',
+                                    r'^require\s*\(\s*[\'"]([^\'"]+)[\'"]\s*\)'
+                                ]
+                                
+                                for line in content.split('\n'):
+                                    for pattern in import_patterns:
+                                        match = re.match(pattern, line.strip())
+                                        if match:
+                                            imported = match.group(1)
+                                            # Handle relative imports
+                                            if imported.startswith('.'):
+                                                imported = os.path.normpath(os.path.join(os.path.dirname(relative_path), imported))
+                                            graph['edges'].append({
+                                                'source': relative_path,
+                                                'target': imported,
+                                                'type': 'imports'
+                                            })
+                                            break
+                                    
+                                    # Look for class inheritance
+                                    class_match = re.match(r'^class\s+\w+\s+extends\s+(\w+)', line.strip())
+                                    if class_match:
+                                        parent_class = class_match.group(1)
+                                        graph['edges'].append({
+                                            'source': relative_path,
+                                            'target': parent_class,
+                                            'type': 'extends'
+                                        })
+                                    
+                                    # Look for interface implementations
+                                    impl_match = re.match(r'^class\s+\w+\s+implements\s+(\w+)', line.strip())
+                                    if impl_match:
+                                        interface = impl_match.group(1)
+                                        graph['edges'].append({
+                                            'source': relative_path,
+                                            'target': interface,
+                                            'type': 'implements'
+                                        })
+                                    
+                                    # Look for component composition
+                                    comp_match = re.search(r'<(\w+)[\s>]', line.strip())
+                                    if comp_match:
+                                        component = comp_match.group(1)
+                                        graph['edges'].append({
+                                            'source': relative_path,
+                                            'target': component,
+                                            'type': 'uses_component'
+                                        })
+                            elif file.endswith(('.java', '.cpp', '.h', '.hpp')):
+                                # Java/C++ imports
+                                import_pattern = r'^(?:import|#include)\s+[\"<]([^\">]+)[\">]'
+                                for line in content.split('\n'):
+                                    match = re.match(import_pattern, line.strip())
+                                    if match:
+                                        imported = match.group(1)
+                                        # Handle relative imports
+                                        if imported.startswith('.'):
+                                            imported = os.path.normpath(os.path.join(os.path.dirname(relative_path), imported))
+                                        graph['edges'].append({
+                                            'source': relative_path,
+                                            'target': imported,
+                                            'type': 'imports'
+                                        })
+                        except Exception as e:
+                            print(f"Error processing file {file_path}: {str(e)}")
+                            continue
+
+                        # Update progress tracking
+                        kb['indexing_state']['processed_files'] += 1
+                        if 'processed_files_list' not in kb['indexing_state']:
+                            kb['indexing_state']['processed_files_list'] = []
+                        kb['indexing_state']['processed_files_list'].append(relative_path)
+                        
+                        # Calculate progress
+                        progress = min(60, int((kb['indexing_state']['processed_files'] / kb['indexing_state']['total_files']) * 50) + 10)
+                        kb['progress'] = progress
+                        
+                        # Save progress every 10 files
+                        if kb['indexing_state']['processed_files'] % 10 == 0:
+                            # Save progress to file
+                            with open(os.path.join(kb_path, 'indexing_progress.json'), 'w') as f:
+                                json.dump(kb['indexing_state'], f)
+                            save_knowledge_bases()
+
+            # Save the graph
+            kb['current_operation'] = 'Saving code graph'
+            kb['progress'] = 70
+            kb['indexing_state']['current_phase'] = 'saving_graph'
+            save_knowledge_bases()
+
+            graph_path = os.path.join(get_kb_data_path(kb_id), GRAPH_PATH)
+            with open(graph_path, 'w') as f:
+                json.dump(graph, f)
+
+            if timeout_occurred[0]:
+                return
+
+            # Create chunks and embeddings
+            kb['current_operation'] = 'Creating code chunks'
+            kb['progress'] = 80
+            kb['indexing_state']['current_phase'] = 'creating_chunks'
+            save_knowledge_bases()
+
+            chunks, embeddings = embed_codebase(kb_path, kb_id)
+            
+            # Create FAISS index
+            kb['current_operation'] = 'Building search index'
+            kb['progress'] = 90
+            kb['indexing_state']['current_phase'] = 'building_index'
+            save_knowledge_bases()
+
+            dimension = embeddings.shape[1]
+            index = faiss.IndexFlatL2(dimension)
+            index.add(embeddings)
+
+            # Save embeddings and chunks
+            save_embeddings(kb_id, chunks, index)
+
+            # Update status to ready
+            kb['status'] = 'ready'
+            kb['progress'] = 100
+            kb['current_operation'] = 'Completed'
+            kb['indexing_state']['current_phase'] = 'completed'
+            save_knowledge_bases()
+
+            # Clean up progress file after successful completion
+            progress_file = os.path.join(kb_path, 'indexing_progress.json')
+            if os.path.exists(progress_file):
+                os.remove(progress_file)
+
+        except Exception as e:
+            print(f"Error during indexing: {str(e)}")
+            traceback.print_exc()
+            kb['status'] = 'error'
+            kb['error_message'] = str(e)
+            save_knowledge_bases()
+        finally:
+            timer.cancel()
+
+    except Exception as e:
+        print(f"Unexpected error in indexing thread for {kb_id}: {str(e)}")
+        kb = knowledge_bases.get(kb_id)
+        if kb:
+            kb['status'] = 'error'
+            kb['error_message'] = f'Unexpected error: {str(e)}'
+            save_knowledge_bases()
+
+@app.route('/api/knowledge-bases/<kb_id>/resume', methods=['POST'])
+def resume_indexing(kb_id):
+    """Resume the indexing process for a knowledge base"""
+    if kb_id not in knowledge_bases:
+        return jsonify({"error": "Knowledge base not found"}), 404
+    
+    kb = knowledge_bases[kb_id]
+    if kb['status'] != 'error':
+        return jsonify({"error": "Can only resume from error state"}), 400
+    
+    try:
+        # Start new indexing thread with resume flag
+        indexing_thread = threading.Thread(
+            target=index_knowledge_base_async,
+            args=(kb_id, True),
+            daemon=True
+        )
+        indexing_threads[kb_id] = indexing_thread
+        indexing_thread.start()
+        
+        return jsonify({
+            "message": "Indexing resumed",
+            "kb_id": kb_id,
+            "status": "indexing"
+        })
+    except Exception as e:
+        return jsonify({"error": f"Error resuming indexing: {str(e)}"}), 500
 
 if __name__ == '__main__':
     # Load model and knowledge bases
