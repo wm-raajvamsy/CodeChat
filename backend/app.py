@@ -81,6 +81,7 @@ EXCLUDED_PATTERNS = [
 instructor_model = None
 knowledge_bases = {}  # Dictionary to hold multiple knowledge bases
 code_graphs = {}  # Dictionary to hold code graphs for each knowledge base
+search_engines = {}  # Dictionary to hold initialized search engines for each knowledge base
 
 # Dictionary to store indexing threads
 indexing_threads = {}
@@ -90,7 +91,7 @@ search_progress = {}
 search_progress_lock = Lock()
 
 # Add at the top with other imports
-SEARCH_TIMEOUT = 1200  # 2 minutes timeout for search operations
+SEARCH_TIMEOUT = 7200  # 2 hours timeout for search operations
 
 def create_directory_if_not_exists(path):
     """Create directory if it doesn't exist"""
@@ -122,8 +123,15 @@ def load_model():
     """Load the Instructor embedding model"""
     global instructor_model
     print("Loading Instructor model...")
-    instructor_model = INSTRUCTOR('hkunlp/instructor-base')
-    print("Model loaded successfully!")
+    try:
+        # Try to load the larger model for better accuracy
+        instructor_model = INSTRUCTOR('hkunlp/instructor-large')
+        print("Instructor-large model loaded successfully!")
+    except Exception as e:
+        print(f"Error loading instructor-large model: {e}")
+        print("Falling back to instructor-base model...")
+        instructor_model = INSTRUCTOR('hkunlp/instructor-base')
+        print("Instructor-base model loaded successfully!")
     return instructor_model
 
 def load_knowledge_bases():
@@ -958,6 +966,50 @@ def get_search_progress(kb_id: str):
     with search_progress_lock:
         return jsonify(search_progress.get(kb_id, {'status': 'not_found'}))
 
+# Store progressive search results
+progressive_search_results = {}
+progressive_results_lock = Lock()
+progressive_results_timestamps = {}  # Store timestamps for cleanup
+
+# Cleanup old progressive search results periodically
+def cleanup_progressive_results():
+    """Remove old progressive search results to prevent memory leaks"""
+    with progressive_results_lock:
+        current_time = time.time()
+        keys_to_remove = []
+        
+        for key, timestamp in progressive_results_timestamps.items():
+            # Remove results older than 30 minutes
+            if current_time - timestamp > 1800:  # 30 minutes in seconds
+                keys_to_remove.append(key)
+        
+        for key in keys_to_remove:
+            if key in progressive_search_results:
+                del progressive_search_results[key]
+            del progressive_results_timestamps[key]
+            
+        print(f"Cleaned up {len(keys_to_remove)} old progressive search results")
+    
+    # Schedule next cleanup in 10 minutes
+    cleanup_timer = Timer(600, cleanup_progressive_results)
+    cleanup_timer.daemon = True
+    cleanup_timer.start()
+
+# Start the cleanup timer
+cleanup_timer = Timer(600, cleanup_progressive_results)
+cleanup_timer.daemon = True
+cleanup_timer.start()
+
+@app.route('/api/progressive-results/<kb_id>/<query_id>', methods=['GET'])
+def get_progressive_results(kb_id: str, query_id: str):
+    """Get progressive search results for a specific query"""
+    with progressive_results_lock:
+        result_key = f"{kb_id}:{query_id}"
+        if result_key not in progressive_search_results:
+            return jsonify({'status': 'not_found'}), 404
+            
+        return jsonify(progressive_search_results[result_key])
+
 @app.route('/api/search', methods=['POST'])
 def search():
     """Enhanced search endpoint using progressive search"""
@@ -965,6 +1017,7 @@ def search():
         data = request.json
         query = data.get('query')
         kb_id = data.get('kb_id')
+        progressive = data.get('progressive', False)  # Flag to enable progressive search
         
         if not query or not kb_id:
             return jsonify({'error': 'Missing query or kb_id'}), 400
@@ -987,7 +1040,22 @@ def search():
         
         # Initialize progressive search
         update_search_progress(kb_id, 40, "Initializing search engine")
-        search_engine = ProgressiveSearch(code_graphs[kb_id], instructor_model)
+        
+        # Check if we already have a search engine for this KB
+        search_engine = None
+        if kb_id in search_engines:
+            search_engine = search_engines[kb_id]
+            update_search_progress(kb_id, 45, "Using existing search engine")
+        else:
+            search_engine = ProgressiveSearch(code_graphs[kb_id], instructor_model, kb_id)
+            
+            # Precompute embeddings and build FAISS index if not already done
+            update_search_progress(kb_id, 45, "Precomputing embeddings (first-time only)")
+            search_engine.precompute_embeddings()
+            
+            # Store the search engine for future use
+            search_engines[kb_id] = search_engine
+            update_search_progress(kb_id, 50, "Search engine initialized")
         
         # Set up progress callback
         def progress_callback(progress: int, operation: str):
@@ -1008,19 +1076,106 @@ def search():
         timer.start()
         
         try:
-            # Perform search
-            update_search_progress(kb_id, 60, "Performing search")
-            results = search_engine.search(query)
-            search_completed.set()
-            
-            if search_error[0]:
-                raise Exception(search_error[0])
-            
-            return jsonify({
-                'results': results,
-                'query': query,
-                'kb_id': kb_id
-            })
+            # For progressive search, we use a different approach
+            if progressive:
+                # Store progressive results
+                progressive_results = {
+                    'initial': None,
+                    'intermediate': None,
+                    'final': None
+                }
+                
+                # Generate a unique query ID
+                import hashlib
+                query_id = hashlib.md5(f"{query}:{time.time()}".encode()).hexdigest()
+                result_key = f"{kb_id}:{query_id}"
+                
+                # Initialize progressive results storage
+                with progressive_results_lock:
+                    progressive_search_results[result_key] = {
+                        'query': query,
+                        'kb_id': kb_id,
+                        'status': 'in_progress',
+                        'stages': {},
+                        'latest_stage': None,
+                        'latest_results': [],
+                        'created_at': time.time()
+                    }
+                    # Store timestamp for cleanup
+                    progressive_results_timestamps[result_key] = time.time()
+                
+                # Set up callback for progressive results
+                def progressive_callback(results, stage):
+                    progressive_results[stage] = results
+                    
+                    # Update progress based on stage
+                    if stage == 'initial':
+                        update_search_progress(kb_id, 70, f"Received {stage} results")
+                    elif stage == 'intermediate':
+                        update_search_progress(kb_id, 85, f"Received {stage} results")
+                    elif stage == 'final':
+                        update_search_progress(kb_id, 100, f"Received {stage} results")
+                    
+                    # Store results for later retrieval
+                    with progressive_results_lock:
+                        if result_key in progressive_search_results:
+                            progressive_search_results[result_key]['stages'][stage] = results
+                            progressive_search_results[result_key]['latest_stage'] = stage
+                            progressive_search_results[result_key]['latest_results'] = results
+                            
+                            if stage == 'final':
+                                progressive_search_results[result_key]['status'] = 'complete'
+                
+                # Start progressive search in a separate thread
+                def run_progressive_search():
+                    try:
+                        search_engine.progressive_search(query, 10, progressive_callback)
+                        search_completed.set()
+                    except Exception as e:
+                        search_error[0] = str(e)
+                        search_completed.set()
+                
+                search_thread = threading.Thread(target=run_progressive_search)
+                search_thread.daemon = True
+                search_thread.start()
+                
+                # Wait for initial results (with timeout)
+                initial_timeout = 2.0  # 2 seconds for initial results
+                start_time = time.time()
+                while not search_completed.is_set() and progressive_results['initial'] is None:
+                    if time.time() - start_time > initial_timeout:
+                        break
+                    time.sleep(0.1)
+                
+                # Return whatever results we have so far
+                results_to_return = progressive_results['final'] or progressive_results['intermediate'] or progressive_results['final'] or []
+                
+                # Update status for client to know there are more results coming
+                status = "complete" if search_completed.is_set() else "in_progress"
+                
+                return jsonify({
+                    'results': results_to_return,
+                    'query': query,
+                    'kb_id': kb_id,
+                    'query_id': query_id,
+                    'status': status,
+                    'stage': next((stage for stage, results in reversed(progressive_results.items()) if results is not None), None)
+                })
+            else:
+                # Regular non-progressive search
+                update_search_progress(kb_id, 60, "Performing search")
+                results = search_engine.search(query)
+                search_completed.set()
+                
+                if search_error[0]:
+                    raise Exception(search_error[0])
+                
+                return jsonify({
+                    'results': results,
+                    'query': query,
+                    'kb_id': kb_id,
+                    'status': 'complete'
+                })
             
         finally:
             timer.cancel()
@@ -1652,20 +1807,8 @@ def index_knowledge_base_async(kb_id: str, resume_from: str = None):
         }
         save_knowledge_bases()
 
-        # Set a longer timeout for code graph building (15 minutes)
-        timeout_seconds = 900  # 15 minutes
+        # No timeout for code graph building
         timeout_occurred = [False]
-
-        def timeout_handler():
-            timeout_occurred[0] = True
-            print(f"Timeout while building code graph for {kb_id}")
-            kb['status'] = 'error'
-            kb['error_message'] = 'Code graph building timed out after 15 minutes. The repository might be too large or complex.'
-            save_knowledge_bases()
-
-        # Start the timeout timer
-        timer = Timer(timeout_seconds, timeout_handler)
-        timer.start()
 
         try:
             kb_path = os.path.join(UPLOADS_DIR, kb_id)
@@ -1904,7 +2047,7 @@ def index_knowledge_base_async(kb_id: str, resume_from: str = None):
             kb['error_message'] = str(e)
             save_knowledge_bases()
         finally:
-            timer.cancel()
+            pass  # No timer to cancel
 
     except Exception as e:
         print(f"Unexpected error in indexing thread for {kb_id}: {str(e)}")

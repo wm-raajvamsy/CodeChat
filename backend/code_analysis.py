@@ -7,16 +7,18 @@ import os
 
 class CodeGraph:
     def __init__(self):
-        self.nodes = {}  # Files, functions, classes
-        self.edges = {}  # Dependencies, calls, imports
+        self.nodes = []  # Files, functions, classes (list of dicts)
+        self.edges = {}  # Dependencies, calls, imports (dict of lists)
         self.file_contents = {}  # Store file contents for reference
         
     def add_node(self, node_id: str, node_type: str, metadata: Dict):
         """Add a node to the graph with its metadata"""
-        self.nodes[node_id] = {
+        # Add node as a dictionary in the list
+        self.nodes.append({
+            'id': node_id,
             'type': node_type,
             'metadata': metadata
-        }
+        })
         
     def add_edge(self, from_id: str, to_id: str, edge_type: str):
         """Add an edge between nodes with a specific type"""
@@ -32,6 +34,12 @@ class CodeGraph:
         related = []
         visited = set()
         
+        # Create a node lookup dictionary for faster access
+        node_lookup = {}
+        for node in self.nodes:
+            if isinstance(node, dict) and 'id' in node:
+                node_lookup[node['id']] = node
+        
         def traverse(current_id: str, depth: int):
             if depth > max_depth or current_id in visited:
                 return
@@ -39,11 +47,13 @@ class CodeGraph:
             visited.add(current_id)
             if current_id in self.edges:
                 for edge in self.edges[current_id]:
-                    related.append({
-                        'node': self.nodes[edge['to']],
-                        'relationship': edge['type']
-                    })
-                    traverse(edge['to'], depth + 1)
+                    to_id = edge.get('to', '')
+                    if to_id and to_id in node_lookup:
+                        related.append({
+                            'node': node_lookup[to_id],
+                            'relationship': edge.get('type', 'unknown')
+                        })
+                        traverse(to_id, depth + 1)
         
         traverse(node_id, 0)
         return related
@@ -64,9 +74,41 @@ class CodeGraph:
         graph = cls()
         with open(path, 'r') as f:
             data = json.load(f)
-            graph.nodes = data['nodes']
-            graph.edges = data['edges']
-            graph.file_contents = data.get('file_contents', {})  # Load file contents if available
+            
+            # Handle nodes - ensure it's a list
+            if 'nodes' in data:
+                if isinstance(data['nodes'], dict):
+                    # Convert dict to list format
+                    nodes_list = []
+                    for node_id, node_data in data['nodes'].items():
+                        node_dict = {'id': node_id}
+                        node_dict.update(node_data)
+                        nodes_list.append(node_dict)
+                    graph.nodes = nodes_list
+                else:
+                    graph.nodes = data['nodes']
+            
+            # Handle edges - ensure it's a dict
+            if 'edges' in data:
+                if isinstance(data['edges'], list):
+                    # Convert list to dict format
+                    edges_dict = {}
+                    for edge in data['edges']:
+                        if 'source' in edge and 'target' in edge:
+                            source = edge['source']
+                            if source not in edges_dict:
+                                edges_dict[source] = []
+                            edges_dict[source].append({
+                                'to': edge['target'],
+                                'type': edge.get('type', 'unknown')
+                            })
+                    graph.edges = edges_dict
+                else:
+                    graph.edges = data['edges']
+            
+            # Load file contents if available
+            graph.file_contents = data.get('file_contents', {})
+            
         return graph
 
 def analyze_python_file(file_path: str, content: str) -> Dict:
@@ -120,7 +162,7 @@ def analyze_python_file(file_path: str, content: str) -> Dict:
         }
 
 def analyze_js_file(file_path: str, content: str) -> Dict:
-    """Analyze a JavaScript file and extract its structure"""
+    """Analyze a JavaScript/TypeScript file and extract its structure"""
     structure = {
         'imports': [],
         'functions': {},
@@ -129,28 +171,82 @@ def analyze_js_file(file_path: str, content: str) -> Dict:
         'usages': {}
     }
     
-    # Extract imports
-    import_pattern = r'(?:import\s+(?:{[^}]*}|\S+)\s+from\s+["\']([^"\']+)["\']|require\(["\']([^"\']+)["\']\))'
-    for match in re.finditer(import_pattern, content):
-        imp = match.group(1) or match.group(2)
-        structure['imports'].append(imp)
-        structure['dependencies'].add(imp)
+    # Extract imports - enhanced pattern to catch more import variations
+    import_patterns = [
+        # ES6 imports
+        r'import\s+(?:{[^}]*}|\*\s+as\s+\w+|\w+)\s+from\s+["\']([^"\']+)["\']',
+        # CommonJS require
+        r'(?:const|let|var)\s+(?:{[^}]*}|\w+)\s*=\s*require\(["\']([^"\']+)["\']\)',
+        # Direct require
+        r'require\(["\']([^"\']+)["\']\)',
+        # Dynamic import
+        r'import\(["\']([^"\']+)["\']\)',
+        # TypeScript imports
+        r'import\s+type\s+(?:{[^}]*}|\w+)\s+from\s+["\']([^"\']+)["\']'
+    ]
     
-    # Extract functions
-    function_pattern = r'(?:function\s+(\w+)|const\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>)'
-    for match in re.finditer(function_pattern, content):
-        func_name = match.group(1) or match.group(2)
-        structure['functions'][func_name] = {
-            'calls': extract_js_function_calls(content, func_name)
-        }
+    for pattern in import_patterns:
+        for match in re.finditer(pattern, content):
+            imp = match.group(1)
+            if imp:
+                structure['imports'].append(imp)
+                structure['dependencies'].add(imp)
     
-    # Extract classes
-    class_pattern = r'class\s+(\w+)'
-    for match in re.finditer(class_pattern, content):
-        class_name = match.group(1)
-        structure['classes'][class_name] = {
-            'methods': extract_js_class_methods(content, class_name)
-        }
+    # Extract functions - enhanced patterns
+    function_patterns = [
+        # Named function declarations
+        r'function\s+(\w+)\s*\([^)]*\)\s*{',
+        # Arrow functions assigned to variables
+        r'(?:const|let|var)\s+(\w+)\s*=\s*(?:async\s*)?\([^)]*\)\s*=>',
+        # Object method definitions
+        r'(\w+)\s*:\s*function\s*\([^)]*\)',
+        # ES6 method definitions
+        r'(\w+)\s*\([^)]*\)\s*{',
+        # TypeScript function with type annotations
+        r'function\s+(\w+)\s*<[^>]*>\s*\([^)]*\)',
+        # Async functions
+        r'async\s+function\s+(\w+)\s*\([^)]*\)'
+    ]
+    
+    for pattern in function_patterns:
+        for match in re.finditer(pattern, content):
+            func_name = match.group(1)
+            if func_name and not func_name in ['if', 'for', 'while', 'switch', 'catch']:
+                # Skip if the match is actually a control structure
+                structure['functions'][func_name] = {
+                    'calls': extract_js_function_calls(content, func_name)
+                }
+    
+    # Extract classes - enhanced patterns
+    class_patterns = [
+        # Standard class declaration
+        r'class\s+(\w+)(?:\s+extends\s+\w+)?\s*{',
+        # TypeScript interface
+        r'interface\s+(\w+)(?:\s+extends\s+\w+)?\s*{',
+        # TypeScript type
+        r'type\s+(\w+)\s*=\s*{',
+        # React component as class
+        r'class\s+(\w+)\s+extends\s+(?:React\.)?Component'
+    ]
+    
+    for pattern in class_patterns:
+        for match in re.finditer(pattern, content):
+            class_name = match.group(1)
+            if class_name:
+                methods = extract_js_class_methods(content, class_name)
+                structure['classes'][class_name] = {
+                    'methods': methods
+                }
+    
+    # Extract React functional components
+    react_component_pattern = r'(?:const|function)\s+(\w+)\s*=?\s*(?:\([^)]*\)|props)\s*=>\s*{'
+    for match in re.finditer(react_component_pattern, content):
+        component_name = match.group(1)
+        if component_name and component_name[0].toUpperCase() == component_name[0]:  # Check if starts with uppercase
+            structure['functions'][component_name] = {
+                'is_component': True,
+                'calls': extract_js_function_calls(content, component_name)
+            }
     
     return structure
 
@@ -168,19 +264,185 @@ def extract_function_calls(node: ast.FunctionDef) -> List[str]:
 def extract_js_function_calls(content: str, func_name: str) -> List[str]:
     """Extract function calls from a JavaScript function"""
     calls = []
-    # This is a simplified version - you might want to use a proper JS parser
-    call_pattern = r'(\w+)\([^)]*\)'
-    for match in re.finditer(call_pattern, content):
-        calls.append(match.group(1))
-    return calls
+    
+    # Find the function definition
+    function_patterns = [
+        # Named function declarations
+        rf'function\s+{re.escape(func_name)}\s*\([^)]*\)\s*{{',
+        # Arrow functions assigned to variables
+        rf'(?:const|let|var)\s+{re.escape(func_name)}\s*=\s*(?:async\s*)?\([^)]*\)\s*=>',
+        # Object method definitions
+        rf'{re.escape(func_name)}\s*:\s*function\s*\([^)]*\)',
+        # ES6 method definitions
+        rf'{re.escape(func_name)}\s*\([^)]*\)\s*{{',
+        # Async functions
+        rf'async\s+function\s+{re.escape(func_name)}\s*\([^)]*\)'
+    ]
+    
+    function_start = -1
+    function_end = -1
+    
+    for pattern in function_patterns:
+        match = re.search(pattern, content)
+        if match:
+            function_start = match.start()
+            # Find the closing brace
+            brace_count = 0
+            in_string = False
+            string_char = None
+            
+            for i in range(function_start, len(content)):
+                char = content[i]
+                
+                # Handle strings to avoid counting braces inside strings
+                if char in ['"', "'"]:
+                    if not in_string:
+                        in_string = True
+                        string_char = char
+                    elif char == string_char:
+                        in_string = False
+                
+                # Skip if we're inside a string
+                if in_string:
+                    continue
+                
+                if char == '{':
+                    brace_count += 1
+                elif char == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        function_end = i + 1
+                        break
+            
+            if function_end > function_start:
+                break
+    
+    # If we found the function, extract calls from its body
+    if function_start >= 0 and function_end > function_start:
+        function_body = content[function_start:function_end]
+        
+        # More comprehensive pattern for function calls
+        call_patterns = [
+            r'(\w+)\s*\([^)]*\)',  # Basic function call
+            r'(\w+)\s*`[^`]*`',    # Template literal call
+            r'new\s+(\w+)\s*\(',   # Constructor call
+            r'(\w+)\s*\.\s*(\w+)\s*\(',  # Method call
+            r'(\w+)\s*\[\s*[^\]]+\s*\]\s*\('  # Computed property call
+        ]
+        
+        for pattern in call_patterns:
+            for match in re.finditer(pattern, function_body):
+                call_name = match.group(1)
+                # Filter out common keywords that aren't function calls
+                if call_name not in ['if', 'for', 'while', 'switch', 'catch', 'function', 'return']:
+                    calls.append(call_name)
+    else:
+        # Fallback to simple pattern if function body not found
+        call_pattern = r'(\w+)\([^)]*\)'
+        for match in re.finditer(call_pattern, content):
+            call_name = match.group(1)
+            if call_name not in ['if', 'for', 'while', 'switch', 'catch']:
+                calls.append(call_name)
+    
+    return list(set(calls))  # Remove duplicates
 
 def extract_js_class_methods(content: str, class_name: str) -> Dict:
     """Extract methods from a JavaScript class"""
     methods = {}
-    # This is a simplified version - you might want to use a proper JS parser
-    method_pattern = r'(\w+)\s*\([^)]*\)\s*{'
-    for match in re.finditer(method_pattern, content):
-        methods[match.group(1)] = {}
+    
+    # Find the class definition
+    class_pattern = rf'class\s+{re.escape(class_name)}(?:\s+extends\s+\w+)?\s*{{'
+    class_match = re.search(class_pattern, content)
+    
+    if class_match:
+        class_start = class_match.start()
+        # Find the closing brace of the class
+        brace_count = 0
+        in_string = False
+        string_char = None
+        class_end = -1
+        
+        for i in range(class_start, len(content)):
+            char = content[i]
+            
+            # Handle strings to avoid counting braces inside strings
+            if char in ['"', "'"]:
+                if not in_string:
+                    in_string = True
+                    string_char = char
+                elif char == string_char:
+                    in_string = False
+            
+            # Skip if we're inside a string
+            if in_string:
+                continue
+            
+            if char == '{':
+                brace_count += 1
+            elif char == '}':
+                brace_count -= 1
+                if brace_count == 0:
+                    class_end = i + 1
+                    break
+        
+        if class_end > class_start:
+            class_body = content[class_start:class_end]
+            
+            # Enhanced method patterns
+            method_patterns = [
+                r'(\w+)\s*\([^)]*\)\s*{',  # Regular method
+                r'async\s+(\w+)\s*\([^)]*\)\s*{',  # Async method
+                r'get\s+(\w+)\s*\(\)\s*{',  # Getter
+                r'set\s+(\w+)\s*\([^)]*\)\s*{',  # Setter
+                r'static\s+(\w+)\s*\([^)]*\)\s*{',  # Static method
+                r'(\w+)\s*=\s*\([^)]*\)\s*=>',  # Arrow function property
+                r'(\w+)\s*=\s*function\s*\([^)]*\)'  # Function property
+            ]
+            
+            for pattern in method_patterns:
+                for match in re.finditer(pattern, class_body):
+                    method_name = match.group(1)
+                    if method_name and method_name not in ['constructor']:
+                        methods[method_name] = {
+                            'calls': extract_js_function_calls(class_body, method_name)
+                        }
+            
+            # Always add constructor if present
+            constructor_match = re.search(r'constructor\s*\([^)]*\)\s*{', class_body)
+            if constructor_match:
+                methods['constructor'] = {
+                    'calls': extract_js_function_calls(class_body, 'constructor')
+                }
+    else:
+        # Fallback for interfaces or types
+        interface_pattern = rf'(?:interface|type)\s+{re.escape(class_name)}(?:\s+extends\s+\w+)?\s*{{'
+        interface_match = re.search(interface_pattern, content)
+        
+        if interface_match:
+            interface_start = interface_match.start()
+            # Find the closing brace
+            brace_count = 0
+            interface_end = -1
+            
+            for i in range(interface_start, len(content)):
+                if content[i] == '{':
+                    brace_count += 1
+                elif content[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        interface_end = i + 1
+                        break
+            
+            if interface_end > interface_start:
+                interface_body = content[interface_start:interface_end]
+                
+                # Extract method signatures from interface
+                method_sig_pattern = r'(\w+)\s*(?:\([^)]*\))?\s*:'
+                for match in re.finditer(method_sig_pattern, interface_body):
+                    method_name = match.group(1)
+                    if method_name:
+                        methods[method_name] = {}
+    
     return methods
 
 def build_code_graph(directory: str) -> CodeGraph:
