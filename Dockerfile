@@ -48,7 +48,7 @@ COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
 # Expose ports
-EXPOSE 6146 3000
+EXPOSE 6146 3000 6379
 
 # Entrypoint
 ENTRYPOINT ["entrypoint.sh"]

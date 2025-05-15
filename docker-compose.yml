@@ -1,0 +1,32 @@
+version: "3.8"
+
+services:
+  redis:
+    image: redis:7
+    container_name: codechat-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: api
+    depends_on:
+      - redis
+    environment:
+      # point your app at the Redis service
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # if you need to override Ollama host, you can set it here
+      # OLLAMA_HOST: host.docker.internal
+    ports:
+      - "6146:6146"   # your Python backend port
+      - "3000:3000"   # React static serve port
+    # give api a bit of time to start if you want healthchecks:
+    healthcheck:
+      test: ["CMD", "nc", "-z", "redis", "6379"]
+      interval: 5s
+      timeout: 2s
+      retries: 5

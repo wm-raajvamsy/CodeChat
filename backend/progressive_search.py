@@ -720,7 +720,7 @@ class ProgressiveSearch:
             if redis_available:
                 try:
                     # Connect to Redis
-                    r = redis.Redis(host='localhost', port=6379, db=0, socket_connect_timeout=1)
+                    r = redis.Redis(host=os.getenv("REDIS_HOST", "localhost"), port=int(os.getenv("REDIS_PORT", 6379)), db=0, socket_connect_timeout=1)
                     
                     # Test connection
                     r.ping()

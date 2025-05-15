@@ -1,8 +1,2 @@
-docker build -t code-chat .
-docker run --name code-chat -d \
-  -p 6146:6146 \
-  -p 3142:3000 \
-  -e OLLAMA_HOST=host.docker.internal \
-  -v /Users/raajr_500278/wavemaker-studio-frontend/wavemaker-rn-runtime:/host_repos/runtime \
-  -v /Users/raajr_500278/wavemaker-studio-frontend/wavemaker-rn-codegen:/host_repos/codegen \
-  code-chat
+Run the following after git clone.
+docker-compose up --build
