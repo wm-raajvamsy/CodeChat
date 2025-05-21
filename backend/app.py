@@ -21,6 +21,8 @@ from logging.handlers import RotatingFileHandler
 import threading
 from threading import Lock, Timer
 import signal
+import google.generativeai as genai
+import uuid
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -93,6 +95,9 @@ search_progress_lock = Lock()
 # Add at the top with other imports
 SEARCH_TIMEOUT = 7200  # 2 hours timeout for search operations
 
+# Add after other global variables
+gemini_model = None
+
 def create_directory_if_not_exists(path):
     """Create directory if it doesn't exist"""
     try:
@@ -155,6 +160,17 @@ def load_knowledge_bases():
     
     return knowledge_bases
 
+def init_gemini():
+    """Initialize the Gemini model"""
+    global gemini_model
+    try:
+        genai.configure(api_key="AIzaSyBSgUp9W_Z6R4EKFGyQkSY3Ug9-JivaRGk")
+        gemini_model = genai.GenerativeModel('gemini-2.0-flash')
+        print("Gemini model initialized successfully!")
+    except Exception as e:
+        print(f"Error initializing Gemini model: {e}")
+        raise
+
 # Initialize server
 def init_server():
     """Initialize server by loading model and knowledge bases"""
@@ -165,8 +181,9 @@ def init_server():
     # Load knowledge bases
     load_knowledge_bases()
     
-    # Load model
+    # Load models
     load_model()
+    init_gemini()
 
 # Initialize on startup
 init_server()
@@ -1012,178 +1029,103 @@ def get_progressive_results(kb_id: str, query_id: str):
 
 @app.route('/api/search', methods=['POST'])
 def search():
-    """Enhanced search endpoint using progressive search"""
+    """Enhanced search endpoint with iterative context building"""
     try:
-        data = request.json
-        query = data.get('query')
+        data = request.get_json()
+        query = data.get('query', '')
         kb_id = data.get('kb_id')
-        progressive = data.get('progressive', False)  # Flag to enable progressive search
+        top_k = data.get('top_k', 5)
         
         if not query or not kb_id:
-            return jsonify({'error': 'Missing query or kb_id'}), 400
-        
+            return jsonify({'error': 'Missing required parameters'}), 400
+            
         if kb_id not in knowledge_bases:
             return jsonify({'error': 'Knowledge base not found'}), 404
-        
-        # Initialize progress
-        update_search_progress(kb_id, 0, "Starting search")
-        
-        # Load code graph if not in memory
-        if kb_id not in code_graphs:
-            update_search_progress(kb_id, 20, "Loading code graph")
-            graph_path = os.path.join(get_kb_data_path(kb_id), GRAPH_PATH)
-            if os.path.exists(graph_path):
-                code_graphs[kb_id] = CodeGraph.load(graph_path)
-            else:
-                update_search_progress(kb_id, 0, "Error: Code graph not found")
-                return jsonify({'error': 'Code graph not found. Please index the knowledge base first.'}), 404
-        
-        # Initialize progressive search
-        update_search_progress(kb_id, 40, "Initializing search engine")
-        
-        # Check if we already have a search engine for this KB
-        search_engine = None
-        if kb_id in search_engines:
-            search_engine = search_engines[kb_id]
-            update_search_progress(kb_id, 45, "Using existing search engine")
-        else:
-            search_engine = ProgressiveSearch(code_graphs[kb_id], instructor_model, kb_id)
             
-            # Precompute embeddings and build FAISS index if not already done
-            update_search_progress(kb_id, 45, "Precomputing embeddings (first-time only)")
-            search_engine.precompute_embeddings()
-            
-            # Store the search engine for future use
-            search_engines[kb_id] = search_engine
-            update_search_progress(kb_id, 50, "Search engine initialized")
+        # Initialize search progress
+        search_id = str(uuid.uuid4())
+        search_progress[kb_id] = {
+            'progress': 0,
+            'operation': 'Starting search',
+            'search_id': search_id
+        }
         
-        # Set up progress callback
         def progress_callback(progress: int, operation: str):
             update_search_progress(kb_id, progress, operation)
-        
-        search_engine.set_progress_callback(progress_callback)
-        
-        # Set up timeout
-        search_completed = threading.Event()
-        search_error = [None]  # Use list to store error message
-        
+            
+        # Set up timeout handler
         def timeout_handler():
-            if not search_completed.is_set():
-                search_error[0] = "Search operation timed out"
-                search_completed.set()
-        
+            if kb_id in search_progress:
+                search_progress[kb_id]['progress'] = 100
+                search_progress[kb_id]['operation'] = 'Search timed out'
+                
         timer = Timer(SEARCH_TIMEOUT, timeout_handler)
         timer.start()
         
         try:
-            # For progressive search, we use a different approach
-            if progressive:
-                # Store progressive results
-                progressive_results = {
-                    'initial': None,
-                    'intermediate': None,
-                    'final': None
-                }
-                
-                # Generate a unique query ID
-                import hashlib
-                query_id = hashlib.md5(f"{query}:{time.time()}".encode()).hexdigest()
-                result_key = f"{kb_id}:{query_id}"
-                
-                # Initialize progressive results storage
-                with progressive_results_lock:
-                    progressive_search_results[result_key] = {
-                        'query': query,
-                        'kb_id': kb_id,
-                        'status': 'in_progress',
-                        'stages': {},
-                        'latest_stage': None,
-                        'latest_results': [],
-                        'created_at': time.time()
-                    }
-                    # Store timestamp for cleanup
-                    progressive_results_timestamps[result_key] = time.time()
-                
-                # Set up callback for progressive results
-                def progressive_callback(results, stage):
-                    progressive_results[stage] = results
-                    
-                    # Update progress based on stage
-                    if stage == 'initial':
-                        update_search_progress(kb_id, 70, f"Received {stage} results")
-                    elif stage == 'intermediate':
-                        update_search_progress(kb_id, 85, f"Received {stage} results")
-                    elif stage == 'final':
-                        update_search_progress(kb_id, 100, f"Received {stage} results")
-                    
-                    # Store results for later retrieval
-                    with progressive_results_lock:
-                        if result_key in progressive_search_results:
-                            progressive_search_results[result_key]['stages'][stage] = results
-                            progressive_search_results[result_key]['latest_stage'] = stage
-                            progressive_search_results[result_key]['latest_results'] = results
-                            
-                            if stage == 'final':
-                                progressive_search_results[result_key]['status'] = 'complete'
-                
-                # Start progressive search in a separate thread
-                def run_progressive_search():
-                    try:
-                        search_engine.progressive_search(query, 10, progressive_callback)
-                        search_completed.set()
-                    except Exception as e:
-                        search_error[0] = str(e)
-                        search_completed.set()
-                
-                search_thread = threading.Thread(target=run_progressive_search)
-                search_thread.daemon = True
-                search_thread.start()
-                
-                # Wait for initial results (with timeout)
-                initial_timeout = 2.0  # 2 seconds for initial results
-                start_time = time.time()
-                while not search_completed.is_set() and progressive_results['initial'] is None:
-                    if time.time() - start_time > initial_timeout:
-                        break
-                    time.sleep(0.1)
-                
-                # Return whatever results we have so far
-                results_to_return = progressive_results['final'] or progressive_results['intermediate'] or progressive_results['final'] or []
-                
-                # Update status for client to know there are more results coming
-                status = "complete" if search_completed.is_set() else "in_progress"
-                
-                return jsonify({
-                    'results': results_to_return,
-                    'query': query,
-                    'kb_id': kb_id,
-                    'query_id': query_id,
-                    'status': status,
-                    'stage': next((stage for stage, results in reversed(progressive_results.items()) if results is not None), None)
-                })
-            else:
-                # Regular non-progressive search
-                update_search_progress(kb_id, 60, "Performing search")
-                results = search_engine.search(query)
-                search_completed.set()
-                
-                if search_error[0]:
-                    raise Exception(search_error[0])
-                
-                return jsonify({
-                    'results': results,
-                    'query': query,
-                    'kb_id': kb_id,
-                    'status': 'complete'
-                })
+            # Get initial search results
+            initial_results = search_kb(kb_id, query, top_k)
             
-        finally:
+            # Initialize context accumulation
+            accumulated_context = initial_results
+            has_enough_context = False
+            targeted_queries = []
+            max_iterations = 3  # Limit iterations to prevent infinite loops
+            current_iteration = 0
+            
+            while not has_enough_context and current_iteration < max_iterations:
+                current_iteration += 1
+                
+                # Analyze context with Gemini
+                has_enough_context, targeted_queries = analyze_context_with_gemini(
+                    query, accumulated_context, kb_id
+                )
+                
+                if not has_enough_context and targeted_queries:
+                    # Execute targeted queries and accumulate results
+                    for targeted_query in targeted_queries:
+                        targeted_results = search_kb(kb_id, targeted_query, top_k)
+                        # Add new results to accumulated context
+                        accumulated_context.extend(targeted_results)
+                        
+                        # Remove duplicates based on file_path and content
+                        seen = set()
+                        accumulated_context = [
+                            result for result in accumulated_context
+                            if not (result['file_path'], result['content']) in seen
+                            and not seen.add((result['file_path'], result['content']))
+                        ]
+                        
+                        # Sort by relevance score
+                        accumulated_context.sort(
+                            key=lambda x: x.get('relevance_score', 0),
+                            reverse=True
+                        )
+                        
+                        # Keep only top_k results
+                        accumulated_context = accumulated_context[:top_k]
+                
+            # Clean up
             timer.cancel()
-        
+            if kb_id in search_progress:
+                del search_progress[kb_id]
+                
+            return jsonify({
+                'results': accumulated_context,
+                'has_enough_context': has_enough_context,
+                'iterations': current_iteration,
+                'targeted_queries': targeted_queries
+            })
+            
+        except Exception as e:
+            timer.cancel()
+            if kb_id in search_progress:
+                del search_progress[kb_id]
+            raise e
+            
     except Exception as e:
         print(f"Error in search: {str(e)}")
-        traceback.print_exc()
-        update_search_progress(kb_id, 0, f"Error: {str(e)}")
+        print(traceback.format_exc())
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/upload', methods=['POST'])
@@ -2084,6 +2026,70 @@ def resume_indexing(kb_id):
         })
     except Exception as e:
         return jsonify({"error": f"Error resuming indexing: {str(e)}"}), 500
+
+def analyze_context_with_gemini(query: str, current_context: List[Dict], kb_id: str) -> Tuple[bool, List[str]]:
+    """Use Gemini to analyze if we have enough context and generate targeted queries"""
+    try:
+        # Format current context for Gemini
+        context_str = "\n".join([
+            f"File: {result['file_path']}\n"
+            f"Content: {result['content']}\n"
+            f"Relevance: {result.get('relevance_score', 0)}\n"
+            for result in current_context
+        ])
+
+        # Create prompt for Gemini
+        prompt = f"""You are a code analysis assistant. Your task is to analyze if we have enough context to answer a query about code.
+
+Given the following query and current context, determine if we have enough information to answer the query.
+If not, generate specific targeted queries to gather missing information.
+
+Query: {query}
+
+Current Context:
+{context_str}
+
+Respond in the following JSON format:
+{{
+    "has_enough_context": true/false,
+    "targeted_queries": ["query1", "query2", ...]
+}}
+
+Only respond with the JSON object, no other text."""
+
+        # Get response from Gemini
+        response = gemini_model.generate_content(prompt)
+        
+        # Extract JSON from response
+        response_text = response.text.strip()
+        
+        # Try to find JSON in the response
+        try:
+            # First try direct JSON parsing
+            result = json.loads(response_text)
+        except json.JSONDecodeError:
+            # If that fails, try to extract JSON from the text
+            import re
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    print(f"Could not parse JSON from response: {response_text}")
+                    return False, []
+            else:
+                print(f"No JSON found in response: {response_text}")
+                return False, []
+        
+        # Validate response format
+        if not isinstance(result, dict) or 'has_enough_context' not in result or 'targeted_queries' not in result:
+            print(f"Invalid response format: {result}")
+            return False, []
+            
+        return bool(result["has_enough_context"]), result["targeted_queries"]
+    except Exception as e:
+        print(f"Error analyzing context with Gemini: {e}")
+        return False, []
 
 if __name__ == '__main__':
     # Load model and knowledge bases

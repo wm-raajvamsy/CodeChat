@@ -35,15 +35,38 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
           label: "OpenAI",
           description: "",
           icon: ICON_MAP['cpu'] || <Cpu size={16} />,
-        })
+        });
+        // Add Gemini models
+        withIcons.push({
+          value: "gemini-2.0-flash",
+          label: "Gemini 2.0 Flash",
+          description: "Google's most capable model for text generation",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        });
+        withIcons.push({
+          value: "gemini-pro-vision",
+          label: "Gemini Pro Vision",
+          description: "Google's model for text and image generation",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        });
         setModelOptions(withIcons);
       } catch (error) {
-        setModelOptions({
+        setModelOptions([{
           value: "openai",
           label: "OpenAI",
           description: "",
           icon: ICON_MAP['cpu'] || <Cpu size={16} />,
-        })
+        }, {
+          value: "gemini-2.0-flash",
+          label: "Gemini 2.0 Flash",
+          description: "Google's most capable model for text generation",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        }, {
+          value: "gemini-pro-vision",
+          label: "Gemini Pro Vision",
+          description: "Google's model for text and image generation",
+          icon: ICON_MAP['cpu'] || <Cpu size={16} />,
+        }]);
         console.error('Failed to load models:', error);
       }
     };
@@ -51,6 +74,12 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
     loadModels();
   }, []);
   
+  // Save config to localStorage when it changes
+  useEffect(() => {
+    if (config) {
+      localStorage.setItem('config', JSON.stringify(config));
+    }
+  }, [config]);
 
   return (
     <div className="flex-1 bg-gray-100 h-full overflow-y-auto">
@@ -173,6 +202,22 @@ export const Settings = ({ config, setConfig, onClearChat, apiStatus }) => {
                 onChange={(e) => {
                   localStorage.setItem("openapikey", e.target.value);
                   setConfig({...config, openaiKey: e.target.value})
+                }}
+                className="w-full h-15 pl-4 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-500"
+              />
+            </div>
+
+            {/* Gemini API Key */}
+            <div className="bg-gray-50 p-4 rounded-lg">
+              <div className="flex justify-between items-center mb-2">
+                <label className="text-gray-700 font-medium">Gemini API Key</label>
+              </div>
+              <input
+                type="text"
+                value={config.geminiKey || localStorage.getItem("geminikey")}
+                onChange={(e) => {
+                  localStorage.setItem("geminikey", e.target.value);
+                  setConfig({...config, geminiKey: e.target.value})
                 }}
                 className="w-full h-15 pl-4 bg-gray-200 rounded-lg appearance-none cursor-pointer accent-blue-500"
               />

@@ -5,8 +5,9 @@ import { searchCombineKnowledgeBase, searchKnowledgeBase } from './knowledgeBase
 
 // API configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:6146/api';
-const OLLAMA_URL = process.env.REACT_APP_OLLAMA_URL || 'http://localhost:11434/api';
+const OLLAMA_URL = process.env.REACT_APP_OLLAMA_URL || 'http://localhost:11434';
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
+const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 // const OPENAI_API_KEY = process.env.OPENAI_API_KEY || localStorage.getItem('openaiKey');
 
 /**
@@ -129,33 +130,73 @@ export const processChat = async (userMessage, knowledgeBases = [], config = {},
 
     // Construct the prompt based on whether we have context
     const prompt = constructPrompt(userMessage, contextSnippets);
-    if (finalConfig.model == "openai") {
+
+    // --- GEMINI PATH ---
+    if (finalConfig.model.startsWith('gemini-')) {
+      const modelName = finalConfig.model;
+      const geminiKey = finalConfig.geminiKey || localStorage.getItem('geminikey');
+      if (!geminiKey) {
+        throw new Error('Gemini API key not found. Please add your API key in settings.');
+      }
+      const response = await axios.post(
+        `${GEMINI_URL}/${modelName}:generateContent?key=${geminiKey}`,
+        {
+          contents: [{
+            parts: [{
+              text: prompt
+            }]
+          }],
+          generationConfig: {
+            temperature: finalConfig.temperature,
+            topK: finalConfig.topK,
+            topP: 0.9,
+            maxOutputTokens: finalConfig.maxTokens,
+          }
+        },
+        {
+          headers: {
+            'Content-Type': 'application/json'
+          }
+        }
+      );
+
+      if (!response.data || !response.data.candidates || !response.data.candidates[0].content) {
+        throw new Error('Invalid response from Gemini API');
+      }
+
+      return response.data.candidates[0].content.parts[0].text;
+    }
+    // --- OPENAI PATH ---
+    else if (finalConfig.model === 'openai') {
       return callOpenAI(prompt, finalConfig.openaiKey);
     }
-    // Call Ollama API with auth token
-    console.log(`Sending prompt to ${finalConfig.model}...`);
-    const response = await axios.post(`${OLLAMA_URL}/generate`, {
-      model: finalConfig.model,
-      prompt: prompt,
-      stream: false,
-      options: {
-        temperature: finalConfig.temperature,
-        top_p: 0.9,
-        top_k: 40,
-        max_tokens: finalConfig.maxTokens,
-      }
-    }, {
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${localStorage.getItem('authToken')}`
-      }
-    });
+    // --- OLLAMA PATH ---
+    else {
+      // Call Ollama API with auth token
+      console.log(`Sending prompt to ${finalConfig.model}...`);
+      const response = await axios.post(`${OLLAMA_URL}/generate`, {
+        model: finalConfig.model,
+        prompt: prompt,
+        stream: false,
+        options: {
+          temperature: finalConfig.temperature,
+          top_p: 0.9,
+          top_k: 40,
+          max_tokens: finalConfig.maxTokens,
+        }
+      }, {
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${localStorage.getItem('authToken')}`
+        }
+      });
 
-    if (!response.data || !response.data.response) {
-      throw new Error('Invalid response from Ollama API');
+      if (!response.data || !response.data.response) {
+        throw new Error('Invalid response from Ollama API');
+      }
+
+      return response.data.response;
     }
-
-    return response.data.response;
   } catch (error) {
     console.error('Error in processChat:', error);
     throw error;
@@ -240,8 +281,39 @@ export const processChatStreaming = async (
     // Construct the prompt based on whether we have context
     const prompt = constructPrompt(userMessage, contextSnippets);
     let response;
+    // --- GEMINI STREAMING PATH ---
+    if (finalConfig.model.startsWith('gemini-')) {
+      const modelName = finalConfig.model;
+      const geminiKey = finalConfig.geminiKey || localStorage.getItem('geminikey');
+      if (!geminiKey) {
+        throw new Error('Gemini API key not found. Please add your API key in settings.');
+      }
+      response = await fetch(
+        `${GEMINI_URL}/${modelName}:streamGenerateContent?key=${geminiKey}`,
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            contents: [{
+              parts: [{
+                text: prompt
+              }]
+            }],
+            generationConfig: {
+              temperature: finalConfig.temperature,
+              topK: finalConfig.topK,
+              topP: 0.9,
+              maxOutputTokens: finalConfig.maxTokens,
+            }
+          }),
+          signal: abortController.signal
+        }
+      );
+    }
     // --- OPENAI STREAMING PATH ---
-    if (finalConfig.model === 'openai') {
+    else if (finalConfig.model === 'openai') {
       response = await fetch(OPENAI_URL, {
         method: 'POST',
         headers: {
@@ -261,8 +333,8 @@ export const processChatStreaming = async (
         }),
         signal: abortController.signal
       });
-
     }
+    // --- OLLAMA STREAMING PATH ---
     else {
       // Start streaming request
       response = await fetch(`${OLLAMA_URL}/generate`, {

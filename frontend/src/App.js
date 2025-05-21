@@ -51,7 +51,8 @@ const App = () => {
     model: 'qwen2.5-coder:7b-instruct',
     streamingEnabled: true,
     combineSearch: false,
-    openaiKey: ""
+    openaiKey: "",
+    geminiKey: ""
   });
 
   // Knowledge base state
@@ -476,6 +477,7 @@ const App = () => {
                 onSendMessage={handleSendMessage}
                 isLoading={loading}
                 selectedKnowledgeBases={selectedKnowledgeBases}
+                config={config}
               />
             </div>
           )}
