@@ -5,7 +5,7 @@ import { searchCombineKnowledgeBase, searchKnowledgeBase } from './knowledgeBase
 
 // API configuration
 const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:6146/api';
-const OLLAMA_URL = process.env.REACT_APP_OLLAMA_URL || 'http://localhost:11434';
+const OLLAMA_URL = process.env.REACT_APP_OLLAMA_URL || 'http://localhost:11434/api';
 const OPENAI_URL = 'https://api.openai.com/v1/chat/completions';
 const GEMINI_URL = 'https://generativelanguage.googleapis.com/v1beta/models';
 // const OPENAI_API_KEY = process.env.OPENAI_API_KEY || localStorage.getItem('openaiKey');

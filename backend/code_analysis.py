@@ -123,8 +123,9 @@ def analyze_python_file(file_path: str, content: str) -> Dict:
             'usages': {}
         }
         
-        # Extract imports
+        # Single traversal for imports, functions, and classes
         for node in ast.walk(tree):
+            # Extract imports
             if isinstance(node, ast.Import):
                 for name in node.names:
                     structure['imports'].append(name.name)
@@ -133,15 +134,14 @@ def analyze_python_file(file_path: str, content: str) -> Dict:
                 if node.module:
                     structure['imports'].append(f"{node.module}.{node.names[0].name}")
                     structure['dependencies'].add(node.module)
-        
-        # Extract functions and classes
-        for node in ast.walk(tree):
-            if isinstance(node, ast.FunctionDef):
+            # Extract functions
+            elif isinstance(node, ast.FunctionDef):
                 structure['functions'][node.name] = {
                     'lineno': node.lineno,
                     'end_lineno': node.end_lineno,
                     'calls': extract_function_calls(node)
                 }
+            # Extract classes
             elif isinstance(node, ast.ClassDef):
                 structure['classes'][node.name] = {
                     'lineno': node.lineno,
@@ -445,44 +445,100 @@ def extract_js_class_methods(content: str, class_name: str) -> Dict:
     
     return methods
 
-def build_code_graph(directory: str) -> CodeGraph:
-    """Build a code graph from a directory"""
+def build_code_graph(directory: str, progress_callback=None, exclude_path_func=None) -> CodeGraph:
+    """
+    Build a code graph from a directory
+    
+    Args:
+        directory: Directory to analyze
+        progress_callback: Optional callback function for progress updates
+        exclude_path_func: Optional function to determine if a path should be excluded
+        
+    Returns:
+        CodeGraph object representing the codebase
+    """
+    from utils import should_exclude_path as default_exclude_path
+    
     graph = CodeGraph()
+    exclude_path = exclude_path_func or default_exclude_path
+    
+    # Get total files for progress reporting
+    total_files = 0
+    supported_extensions = ('.py', '.js', '.jsx', '.ts', '.tsx')
+    
+    if progress_callback:
+        # Count files first for accurate progress reporting
+        for root, _, files in os.walk(directory):
+            rel_path = os.path.relpath(root, directory)
+            if exclude_path(rel_path):
+                continue
+                
+            for file in files:
+                if file.endswith(supported_extensions):
+                    file_path = os.path.join(rel_path, file)
+                    if not exclude_path(file_path):
+                        total_files += 1
+        
+        progress_callback(0, f"Found {total_files} files to analyze")
+    
+    # Process files
+    processed_files = 0
     
     for root, _, files in os.walk(directory):
+        rel_path = os.path.relpath(root, directory)
+        if exclude_path(rel_path):
+            continue
+            
         for file in files:
-            if file.endswith(('.py', '.js', '.jsx', '.ts', '.tsx')):
+            if file.endswith(supported_extensions):
                 file_path = os.path.join(root, file)
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                    graph.file_contents[file_path] = content
+                rel_file_path = os.path.relpath(file_path, directory)
+                
+                if exclude_path(rel_file_path):
+                    continue
                     
-                    # Add file node
-                    graph.add_node(file_path, 'file', {
-                        'name': file,
-                        'path': file_path
-                    })
-                    
-                    # Analyze file content
-                    if file.endswith('.py'):
-                        structure = analyze_python_file(file_path, content)
-                    else:
-                        structure = analyze_js_file(file_path, content)
-                    
-                    # Add function nodes and edges
-                    for func_name, func_data in structure['functions'].items():
-                        func_id = f"{file_path}::{func_name}"
-                        graph.add_node(func_id, 'function', {
-                            'name': func_name,
-                            'file': file_path,
-                            'lineno': func_data.get('lineno'),
-                            'end_lineno': func_data.get('end_lineno')
-                        })
-                        graph.add_edge(file_path, func_id, 'contains')
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        graph.file_contents[file_path] = content
                         
-                        # Add call edges
-                        for call in func_data.get('calls', []):
-                            graph.add_edge(func_id, call, 'calls')
+                        # Add file node
+                        graph.add_node(file_path, 'file', {
+                            'name': file,
+                            'path': file_path
+                        })
+                        
+                        # Analyze file content
+                        if file.endswith('.py'):
+                            structure = analyze_python_file(file_path, content)
+                        else:
+                            structure = analyze_js_file(file_path, content)
+                        
+                        # Add function nodes and edges
+                        for func_name, func_data in structure['functions'].items():
+                            func_id = f"{file_path}::{func_name}"
+                            graph.add_node(func_id, 'function', {
+                                'name': func_name,
+                                'file': file_path,
+                                'lineno': func_data.get('lineno'),
+                                'end_lineno': func_data.get('end_lineno')
+                            })
+                            
+                        # Update progress
+                        processed_files += 1
+                        if progress_callback and total_files > 0:
+                            progress = int((processed_files / total_files) * 100)
+                            progress_callback(progress, f"Analyzed {processed_files}/{total_files} files")
+                            
+                except Exception as e:
+                    import logging
+                    logging.error(f"Error processing file {file_path}: {str(e)}")
+                    # Continue with other files
+                    graph.add_edge(file_path, func_id, 'contains')
+                    
+                    # Add call edges
+                    for call in func_data.get('calls', []):
+                        graph.add_edge(func_id, call, 'calls')
                     
                     # Add class nodes and edges
                     for class_name, class_data in structure['classes'].items():

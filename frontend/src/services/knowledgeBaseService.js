@@ -159,21 +159,21 @@ export const getSearchProgress = async (id) => {
  * @returns {Promise<Array>} - Array of search results
  */
 export const searchKnowledgeBase = async (id, query, topK = 5, onProgress) => {
+  let progressInterval;
   try {
     // Start progress polling
-    let progressInterval;
     if (onProgress) {
       progressInterval = setInterval(async () => {
         try {
           const progress = await getSearchProgress(id);
           onProgress(progress);
-          if (progress.status === 'complete' || progress.status === 'error') {
+          if (progress.progress === 100 || progress.status === 'complete' || progress.status === 'error') {
             clearInterval(progressInterval);
           }
         } catch (error) {
           console.error('Error polling search progress:', error);
         }
-      }, 5000); // Poll every 5 seconds instead of 500ms
+      }, 1000); // Poll every 1 second for more responsive updates
     }
 
     const response = await axios.post(
@@ -191,8 +191,13 @@ export const searchKnowledgeBase = async (id, query, topK = 5, onProgress) => {
       clearInterval(progressInterval);
     }
 
-    return response.data.results;
+    // Return both results and thinking details if available
+    return response.data.results || [];
   } catch (error) {
+    // Clear progress polling on error
+    if (progressInterval) {
+      clearInterval(progressInterval);
+    }
     throw handleApiError(error, 'Failed to search knowledge base');
   }
 };

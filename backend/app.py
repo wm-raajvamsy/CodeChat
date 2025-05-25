@@ -19,10 +19,11 @@ from progressive_search import ProgressiveSearch
 import logging
 from logging.handlers import RotatingFileHandler
 import threading
-from threading import Lock, Timer
+from threading import Lock, Timer, Thread
 import signal
 import google.generativeai as genai
 import uuid
+from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)  # Enable CORS for all routes
@@ -325,45 +326,11 @@ def clone_git_repository(git_url: str, kb_id: str) -> str:
         print(f"Error cloning/copying repository: {e}")
         raise
 
-def extract_imports(content: str, file_ext: str) -> List[str]:
-    """Extract import statements based on file type"""
-    imports = []
-    if file_ext in SUPPORTED_EXTENSIONS['python']:
-        # Python imports
-        import_pattern = r'^(?:from\s+(\S+)\s+import\s+|import\s+(\S+))'
-        for line in content.split('\n'):
-            match = re.match(import_pattern, line)
-            if match:
-                imp = match.group(1) or match.group(2)
-                imports.append(imp)
-    elif file_ext in SUPPORTED_EXTENSIONS['javascript']:
-        # JavaScript imports
-        import_pattern = r'(?:import\s+(?:{[^}]*}|\S+)\s+from\s+["\']([^"\']+)["\']|require\(["\']([^"\']+)["\']\))'
-        for match in re.finditer(import_pattern, content):
-            imp = match.group(1) or match.group(2)
-            imports.append(imp)
-    return imports
+# Import extraction moved to utils.py
+from utils import extract_imports
 
-def should_exclude_path(path: str) -> bool:
-    """Check if a path should be excluded based on patterns"""
-    path_parts = path.split(os.sep)
-    
-    for pattern in EXCLUDED_PATTERNS:
-        # Handle glob patterns
-        if pattern.startswith('*'):
-            if path.endswith(pattern[1:]):
-                return True
-        elif pattern.endswith('*'):
-            if path.startswith(pattern[:-1]):
-                return True
-        else:
-            # Check if pattern matches any part of the path exactly
-            if any(part == pattern for part in path_parts):
-                return True
-            # Check if pattern is a file extension and path ends with it
-            if pattern.startswith('.') and path.endswith(pattern):
-                return True
-    return False
+# Path exclusion moved to utils.py
+from utils import should_exclude_path
 
 # ========== CODE PARSING FUNCTIONS ==========
 def parse_python_file(file_path: str, content: str) -> List[CodeChunk]:
@@ -971,11 +938,27 @@ def status():
 def update_search_progress(kb_id: str, progress: int, operation: str):
     """Update search progress for a knowledge base"""
     with search_progress_lock:
-        search_progress[kb_id] = {
-            'progress': progress,
-            'current_operation': operation,
-            'status': 'searching'
-        }
+        if kb_id in search_progress:
+            # Update existing progress object while preserving other fields
+            search_progress[kb_id].update({
+                'progress': progress,
+                'operation': operation,
+                'current_operation': operation,  # For backward compatibility
+                'status': 'searching'
+            })
+        else:
+            # Create new progress object
+            search_progress[kb_id] = {
+                'progress': progress,
+                'operation': operation,
+                'current_operation': operation,
+                'status': 'searching',
+                'current_iteration': 0,
+                'max_iterations': 3,
+                'targeted_queries': [],
+                'context_status': 'gathering',
+                'thinking_details': []
+            }
 
 @app.route('/api/search-progress/<kb_id>', methods=['GET'])
 def get_search_progress(kb_id: str):
@@ -1047,7 +1030,12 @@ def search():
         search_progress[kb_id] = {
             'progress': 0,
             'operation': 'Starting search',
-            'search_id': search_id
+            'search_id': search_id,
+            'current_iteration': 0,
+            'max_iterations': 3,
+            'targeted_queries': [],
+            'context_status': 'gathering',
+            'thinking_details': []
         }
         
         def progress_callback(progress: int, operation: str):
@@ -1058,13 +1046,16 @@ def search():
             if kb_id in search_progress:
                 search_progress[kb_id]['progress'] = 100
                 search_progress[kb_id]['operation'] = 'Search timed out'
+                search_progress[kb_id]['context_status'] = 'error'
                 
         timer = Timer(SEARCH_TIMEOUT, timeout_handler)
         timer.start()
         
         try:
             # Get initial search results
+            update_search_progress(kb_id, 10, 'Performing initial search')
             initial_results = search_kb(kb_id, query, top_k)
+            update_search_progress(kb_id, 30, 'Initial search completed')
             
             # Initialize context accumulation
             accumulated_context = initial_results
@@ -1073,18 +1064,76 @@ def search():
             max_iterations = 3  # Limit iterations to prevent infinite loops
             current_iteration = 0
             
+            # Store initial thinking details
+            search_progress[kb_id]['thinking_details'].append({
+                'step': 'Initial search',
+                'details': f'Found {len(initial_results)} initial results',
+                'timestamp': datetime.now().isoformat()
+            })
+            
             while not has_enough_context and current_iteration < max_iterations:
                 current_iteration += 1
                 
+                # Update progress for this iteration
+                update_search_progress(
+                    kb_id, 
+                    30 + (current_iteration * 20), 
+                    f'Analyzing context - iteration {current_iteration}/{max_iterations}'
+                )
+                search_progress[kb_id]['current_iteration'] = current_iteration
+                
                 # Analyze context with Gemini
+                search_progress[kb_id]['thinking_details'].append({
+                    'step': f'Iteration {current_iteration} - Analysis',
+                    'details': 'Analyzing current context to determine if more information is needed',
+                    'timestamp': datetime.now().isoformat()
+                })
+                
                 has_enough_context, targeted_queries = analyze_context_with_gemini(
                     query, accumulated_context, kb_id
                 )
                 
-                if not has_enough_context and targeted_queries:
+                # Update progress with analysis results
+                search_progress[kb_id]['targeted_queries'] = targeted_queries
+                
+                if has_enough_context:
+                    search_progress[kb_id]['context_status'] = 'complete'
+                    search_progress[kb_id]['thinking_details'].append({
+                        'step': f'Iteration {current_iteration} - Complete',
+                        'details': 'Sufficient context gathered to answer the query',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                elif not targeted_queries:
+                    search_progress[kb_id]['context_status'] = 'incomplete'
+                    search_progress[kb_id]['thinking_details'].append({
+                        'step': f'Iteration {current_iteration} - Incomplete',
+                        'details': 'Unable to generate targeted queries for missing context',
+                        'timestamp': datetime.now().isoformat()
+                    })
+                else:
                     # Execute targeted queries and accumulate results
-                    for targeted_query in targeted_queries:
+                    for i, targeted_query in enumerate(targeted_queries):
+                        query_desc = f"Executing targeted query {i+1}/{len(targeted_queries)}: '{targeted_query}'"
+                        update_search_progress(
+                            kb_id,
+                            30 + (current_iteration * 20) + (i * 5),
+                            query_desc
+                        )
+                        
+                        search_progress[kb_id]['thinking_details'].append({
+                            'step': f'Iteration {current_iteration} - Query {i+1}',
+                            'details': query_desc,
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        
                         targeted_results = search_kb(kb_id, targeted_query, top_k)
+                        
+                        search_progress[kb_id]['thinking_details'].append({
+                            'step': f'Iteration {current_iteration} - Results {i+1}',
+                            'details': f'Found {len(targeted_results)} results for targeted query',
+                            'timestamp': datetime.now().isoformat()
+                        })
+                        
                         # Add new results to accumulated context
                         accumulated_context.extend(targeted_results)
                         
@@ -1105,21 +1154,43 @@ def search():
                         # Keep only top_k results
                         accumulated_context = accumulated_context[:top_k]
                 
+            # Final update
+            update_search_progress(kb_id, 100, 'Search completed')
+            
             # Clean up
             timer.cancel()
-            if kb_id in search_progress:
-                del search_progress[kb_id]
+            
+            # Keep the progress data for a short time so the frontend can retrieve it
+            # We'll use a background thread to clean it up after a delay
+            def delayed_cleanup():
+                time.sleep(10)  # Keep progress data for 10 seconds
+                if kb_id in search_progress:
+                    del search_progress[kb_id]
+                    
+            cleanup_thread = Thread(target=delayed_cleanup)
+            cleanup_thread.daemon = True
+            cleanup_thread.start()
                 
             return jsonify({
                 'results': accumulated_context,
                 'has_enough_context': has_enough_context,
                 'iterations': current_iteration,
-                'targeted_queries': targeted_queries
+                'targeted_queries': targeted_queries,
+                'thinking_details': search_progress[kb_id]['thinking_details']
             })
             
         except Exception as e:
             timer.cancel()
             if kb_id in search_progress:
+                search_progress[kb_id]['context_status'] = 'error'
+                search_progress[kb_id]['operation'] = f'Error: {str(e)}'
+                search_progress[kb_id]['thinking_details'].append({
+                    'step': 'Error',
+                    'details': str(e),
+                    'timestamp': datetime.now().isoformat()
+                })
+                # Keep progress data for a short time for frontend to see the error
+                time.sleep(5)
                 del search_progress[kb_id]
             raise e
             
@@ -2042,7 +2113,7 @@ def analyze_context_with_gemini(query: str, current_context: List[Dict], kb_id: 
         prompt = f"""You are a code analysis assistant. Your task is to analyze if we have enough context to answer a query about code.
 
 Given the following query and current context, determine if we have enough information to answer the query.
-If not, generate specific targeted queries to gather missing information.
+If not, generate specific targeted queries to gather missing information and explain what's missing.
 
 Query: {query}
 
@@ -2052,7 +2123,9 @@ Current Context:
 Respond in the following JSON format:
 {{
     "has_enough_context": true/false,
-    "targeted_queries": ["query1", "query2", ...]
+    "missing_information": "Detailed explanation of what information is missing (if any)",
+    "targeted_queries": ["query1", "query2", ...],
+    "reasoning": "Your reasoning process for determining if context is sufficient"
 }}
 
 Only respond with the JSON object, no other text."""
@@ -2082,13 +2155,24 @@ Only respond with the JSON object, no other text."""
                 return False, []
         
         # Validate response format
-        if not isinstance(result, dict) or 'has_enough_context' not in result or 'targeted_queries' not in result:
+        if not isinstance(result, dict) or 'has_enough_context' not in result:
             print(f"Invalid response format: {result}")
             return False, []
+        
+        # Update search progress with reasoning and missing information
+        if kb_id in search_progress:
+            search_progress[kb_id]['reasoning'] = result.get('reasoning', 'No reasoning provided')
+            search_progress[kb_id]['missing_information'] = result.get('missing_information', 'No details provided')
+            
+        # Ensure targeted_queries exists
+        if 'targeted_queries' not in result:
+            result['targeted_queries'] = []
             
         return bool(result["has_enough_context"]), result["targeted_queries"]
     except Exception as e:
         print(f"Error analyzing context with Gemini: {e}")
+        if kb_id in search_progress:
+            search_progress[kb_id]['reasoning'] = f"Error during analysis: {str(e)}"
         return False, []
 
 if __name__ == '__main__':

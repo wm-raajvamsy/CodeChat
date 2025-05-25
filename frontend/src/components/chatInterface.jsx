@@ -105,20 +105,79 @@ export const ChatInterface = ({
 
         {isLoading && (
           <div className="flex justify-start">
-            <div className="bg-gray-700 text-gray-200 rounded-lg p-3">
-              <div className="flex items-center space-x-2">
+            <div className="bg-gray-700 text-gray-200 rounded-lg p-3 w-full max-w-3xl">
+              <div className="flex items-center space-x-2 mb-2">
                 <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
-                <span>Thinking...</span>
+                <span className="font-medium">Thinking...</span>
               </div>
+              
               {Object.entries(searchProgress).map(([kbId, progress]) => (
                 <div key={kbId} className="mt-2">
-                  <div className="text-xs text-gray-400">{progress.current_operation}</div>
-                  <div className="w-full bg-gray-600 rounded-full h-1.5 mt-1">
+                  <div className="flex justify-between items-center mb-1">
+                    <div className="text-sm text-gray-300 font-medium">{progress.operation}</div>
+                    <div className="text-xs text-gray-400">
+                      {progress.current_iteration > 0 && 
+                        `Iteration ${progress.current_iteration}/${progress.max_iterations}`
+                      }
+                    </div>
+                  </div>
+                  
+                  <div className="w-full bg-gray-600 rounded-full h-2 mb-3">
                     <div
-                      className="bg-blue-500 h-1.5 rounded-full transition-all duration-300"
+                      className="bg-blue-500 h-2 rounded-full transition-all duration-300"
                       style={{ width: `${progress.progress}%` }}
                     ></div>
                   </div>
+                  
+                  {/* Thinking Details Accordion */}
+                  {progress.thinking_details && progress.thinking_details.length > 0 && (
+                    <details className="bg-gray-800 rounded-md mt-2 overflow-hidden">
+                      <summary className="px-3 py-2 cursor-pointer hover:bg-gray-750 text-sm font-medium flex items-center">
+                        <svg xmlns="http://www.w3.org/2000/svg" className="h-4 w-4 mr-2" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+                        </svg>
+                        Context Gathering Process
+                      </summary>
+                      <div className="px-3 py-2 text-xs text-gray-400 border-t border-gray-700">
+                        <ul className="space-y-2">
+                          {progress.thinking_details.map((detail, index) => (
+                            <li key={index} className="pb-2 border-b border-gray-700 last:border-0">
+                              <div className="font-medium text-gray-300">{detail.step}</div>
+                              <div className="mt-1">{detail.details}</div>
+                            </li>
+                          ))}
+                        </ul>
+                        
+                        {/* Missing Information Section */}
+                        {progress.missing_information && (
+                          <div className="mt-3 pt-2 border-t border-gray-700">
+                            <div className="font-medium text-gray-300 mb-1">Missing Information:</div>
+                            <div className="text-gray-400">{progress.missing_information}</div>
+                          </div>
+                        )}
+                        
+                        {/* Targeted Queries Section */}
+                        {progress.targeted_queries && progress.targeted_queries.length > 0 && (
+                          <div className="mt-3 pt-2 border-t border-gray-700">
+                            <div className="font-medium text-gray-300 mb-1">Targeted Queries:</div>
+                            <ul className="list-disc pl-4 space-y-1">
+                              {progress.targeted_queries.map((query, idx) => (
+                                <li key={idx} className="text-gray-400">{query}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        
+                        {/* Reasoning Section */}
+                        {progress.reasoning && (
+                          <div className="mt-3 pt-2 border-t border-gray-700">
+                            <div className="font-medium text-gray-300 mb-1">Reasoning:</div>
+                            <div className="text-gray-400">{progress.reasoning}</div>
+                          </div>
+                        )}
+                      </div>
+                    </details>
+                  )}
                 </div>
               ))}
             </div>
